@@ -32,6 +32,21 @@ logger = logging.getLogger(__name__)
 #   *_lines / *_chars / *_radius -> count (int)
 DEFAULTS: dict = {
     "default_wsl_distro": "Ubuntu-24.04",
+    # OCR language for content tools (get_screen_text, get_screen_text_compact,
+    # detect_text_elements, click_text). Keep CJK here.
+    "ocr_lang": "eng+jpn",
+    # OCR language for command/poll tools (run_*_and_read, execute_and_read,
+    # wait_for_text, get_terminal_output). ASCII output -> eng is fast + clean.
+    "ocr_fast_lang": "eng",
+    # Optional default [x, y, w, h] region for get_terminal_output. null = full
+    # screen (tail). Set a bottom-screen region to read only the prompt area.
+    "terminal_region": None,
+    # screen_changed/wait_for_screen_change: a pixel counts as "changed" when
+    # its grayscale delta exceeds this (0-255); score = fraction of such pixels.
+    "screen_diff_pixel_delta": 30,
+    # Clear the target input line (PSReadLine Esc/RevertLine) before typing a
+    # command, so back-to-back run_* calls do not concatenate onto leftover text.
+    "clear_input_before_command": True,
     "click_hold_ms": 50,
     "click_after_ms": 100,
     "key_hold_ms": 30,
@@ -55,6 +70,11 @@ _INT = int
 _FLOAT = float
 _SPECS: dict = {
     "default_wsl_distro": (str, None, None),
+    "ocr_lang": (str, None, None),
+    "ocr_fast_lang": (str, None, None),
+    "terminal_region": ("region", None, None),
+    "screen_diff_pixel_delta": (_INT, 0, 255),
+    "clear_input_before_command": (bool, None, None),
     "click_hold_ms": (_INT, 0, 10000),
     "click_after_ms": (_INT, 0, 10000),
     "key_hold_ms": (_INT, 0, 10000),
@@ -106,6 +126,21 @@ def _coerce(key: str, value):
     if key not in _SPECS:
         raise ValueError(f"unknown config key: {key}")
     typ, lo, hi = _SPECS[key]
+    if typ == "region":
+        if value is None:
+            return None
+        if (isinstance(value, (list, tuple)) and len(value) == 4
+                and all(isinstance(v, (int, float)) for v in value)):
+            return [int(v) for v in value]
+        raise ValueError(f"{key} must be null or [x, y, w, h]")
+    if typ is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true"
+        if value in (0, 1):
+            return bool(value)
+        raise ValueError(f"{key} must be a boolean")
     if typ is str:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{key} must be a non-empty string")

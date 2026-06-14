@@ -252,3 +252,83 @@ def test_runtime_config_env_override(tmp_path):
         assert "wait_poll_ms" in cfg.env_keys
     finally:
         del os.environ["SHKVM_RT_WAIT_POLL_MS"]
+
+
+# --- V2.1: changed-pixel-fraction diff metric ------------------------------
+
+def test_diff_score_fraction_identical_zero():
+    img = Image.new("L", (50, 50), 0)
+    assert srv._diff_score(img, img.copy()) == 0.0
+
+
+def test_diff_score_fraction_full_change_one():
+    assert srv._diff_score(Image.new("L", (50, 50), 0),
+                           Image.new("L", (50, 50), 255)) == 1.0
+
+
+def test_diff_score_respects_pixel_delta():
+    a = Image.new("L", (50, 50), 100)
+    b = Image.new("L", (50, 50), 110)  # uniform delta of 10
+    assert srv._diff_score(a, b, pixel_delta=30) == 0.0   # 10 < 30 -> no change
+    assert srv._diff_score(a, b, pixel_delta=5) == 1.0    # 10 > 5  -> all changed
+
+
+def test_diff_score_sparse_text_is_small_but_nonzero():
+    a = Image.new("L", (100, 100), 0)
+    b = a.copy()
+    for x in range(10):
+        for y in range(10):
+            b.putpixel((x, y), 255)  # 100 of 10000 px = 1%
+    score = srv._diff_score(a, b, pixel_delta=30)
+    assert 0.005 < score < 0.02
+
+
+# --- V2.1: config region/bool coercion -------------------------------------
+
+def test_config_region_accepts_null_and_quad(tmp_path):
+    cfg = _fresh_config(tmp_path)
+    cfg.update({"terminal_region": [0, 500, 1920, 580]})
+    assert cfg.get("terminal_region") == [0, 500, 1920, 580]
+    cfg.update({"terminal_region": None})
+    assert cfg.get("terminal_region") is None
+
+
+def test_config_region_rejects_bad_shape(tmp_path):
+    cfg = _fresh_config(tmp_path)
+    raised = False
+    try:
+        cfg.update({"terminal_region": [1, 2, 3]})
+    except ValueError:
+        raised = True
+    assert raised
+
+
+def test_config_bool_coercion(tmp_path):
+    cfg = _fresh_config(tmp_path)
+    cfg.update({"clear_input_before_command": "false"})
+    assert cfg.get("clear_input_before_command") is False
+    cfg.update({"clear_input_before_command": True})
+    assert cfg.get("clear_input_before_command") is True
+
+
+def test_config_ocr_lang_keys(tmp_path):
+    cfg = _fresh_config(tmp_path)
+    assert cfg.get("ocr_lang") == "eng+jpn"
+    assert cfg.get("ocr_fast_lang") == "eng"
+    cfg.update({"ocr_fast_lang": "eng+jpn"})
+    assert cfg.get("ocr_fast_lang") == "eng+jpn"
+
+
+# --- V2.1: OCR lang override plumbing --------------------------------------
+
+def test_extract_text_accepts_lang_override():
+    img = Image.new("RGB", (400, 120), "white")
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("arial.ttf", 40)
+    except Exception:
+        font = ImageFont.load_default()
+    draw.text((20, 30), "hello", fill="black", font=font)
+    # explicit eng override must not raise and should read ASCII text
+    txt = TerminalOCR().extract_text(img, lang="eng")
+    assert "hello" in txt.lower()

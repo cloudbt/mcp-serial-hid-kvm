@@ -80,12 +80,15 @@ class TerminalOCR:
 
         return img
 
-    def extract_text(self, image: Image.Image, preprocess: bool = True) -> str:
+    def extract_text(self, image: Image.Image, preprocess: bool = True,
+                     lang: str | None = None) -> str:
         """Extract text from a screen capture.
 
         Args:
             image: PIL Image
             preprocess: Whether to apply preprocessing
+            lang: Tesseract language override (e.g. "eng", "eng+jpn"). Uses the
+                configured default when None.
 
         Returns:
             Extracted text
@@ -98,7 +101,7 @@ class TerminalOCR:
         try:
             text = pytesseract.image_to_string(
                 processed,
-                lang=self.tesseract_lang,
+                lang=lang or self.tesseract_lang,
                 config=self.tesseract_config,
             )
             return self._postprocess_text(text)
@@ -111,6 +114,7 @@ class TerminalOCR:
         image: Image.Image,
         preprocess: bool = True,
         min_confidence: float = 0.0,
+        lang: str | None = None,
     ) -> list[dict]:
         """Extract text elements with bounding boxes using Tesseract TSV output.
 
@@ -139,7 +143,7 @@ class TerminalOCR:
         try:
             data = pytesseract.image_to_data(
                 processed,
-                lang=self.tesseract_lang,
+                lang=lang or self.tesseract_lang,
                 config=self.tesseract_config,
                 output_type=Output.DICT,
             )

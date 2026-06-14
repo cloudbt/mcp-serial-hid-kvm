@@ -145,14 +145,22 @@ def _compact_ocr_error(text: str, limit: int = 200) -> dict:
     return {"ok": False, "error": "ocr_failed", "detail": detail}
 
 
-def _diff_score(img_a: Image.Image, img_b: Image.Image) -> float:
-    """Mean absolute grayscale difference between two images, normalized 0..1."""
+def _diff_score(img_a: Image.Image, img_b: Image.Image,
+                pixel_delta: int = 30) -> float:
+    """Fraction (0..1) of pixels whose grayscale value changed by > pixel_delta.
+
+    A changed-pixel fraction is far more sensitive than a mean difference for
+    "dark screen, different text" transitions (e.g. VS Code -> a full page of
+    terminal text), where only the text strokes differ and a mean is diluted by
+    the unchanged dark background.
+    """
     a = img_a.convert("L")
     b = img_b.convert("L")
     if a.size != b.size:
         b = b.resize(a.size)
     diff = ImageChops.difference(a, b)
-    return ImageStat.Stat(diff).mean[0] / 255.0
+    mask = diff.point(lambda v: 255 if v > pixel_delta else 0)
+    return ImageStat.Stat(mask).mean[0] / 255.0
 
 
 def _escape_ps_double_quotes(text: str) -> str:
@@ -309,26 +317,47 @@ def _do_health(client: KvmClient) -> dict:
     }
 
 
+def _clear_input_line(client: KvmClient) -> None:
+    """Clear the target's current input line before typing a fresh command.
+
+    Uses Esc (PSReadLine RevertLine) so leftover text from a prior step does not
+    concatenate with the new command. Safe at an empty prompt; does not interrupt
+    a running foreground process. No-op when clear_input_before_command is false.
+    Tuned for a PowerShell/PSReadLine prompt (the shell our command tools type
+    into); inside raw bash, Esc is a meta prefix rather than a line clear.
+    """
+    if not get_config().get("clear_input_before_command"):
+        return
+    try:
+        client.send_key("escape")
+    except KvmClientError:
+        pass
+
+
 async def _run_target_command(
     client: KvmClient,
     command: str,
     wait_seconds: float,
     max_lines: int,
     max_chars: int,
+    lang: str | None = None,
 ) -> tuple[bool, str, bool]:
     """Type *command* into the focused target shell, wait, OCR, return tail output.
 
-    Returns ``(ok, output_or_error_detail, truncated)``. The command text is
-    sent in raw mode (no {tag} interpretation) followed by Enter. ``ok`` is
-    False only when OCR itself failed (output holds a compact error detail).
+    Returns ``(ok, output_or_error_detail, truncated)``. The current input line
+    is cleared first (see _clear_input_line), then the command is sent in raw
+    mode (no {tag} interpretation) followed by Enter. ``ok`` is False only when
+    OCR itself failed (output holds a compact error detail).
     """
     validate_chars(command)
+    _clear_input_line(client)
+    await asyncio.sleep(0.05)
     client.type_text(command, raw=True)
     await asyncio.sleep(0.1)
     client.send_key("enter")
     await asyncio.sleep(max(0.0, min(wait_seconds, _hard_max_wait())))
     image = _capture_image()
-    text = get_ocr().extract_text(image)
+    text = get_ocr().extract_text(image, lang=lang or get_config().get("ocr_fast_lang"))
     if _ocr_failed(text):
         err = _compact_ocr_error(text)
         return False, err["detail"], False
@@ -359,9 +388,9 @@ def _match_text(haystack: str, needle: str, mode: str) -> tuple[bool, int]:
     return (count > 0, count)
 
 
-def _ocr_region_text(region) -> str:
+def _ocr_region_text(region, lang: str | None = None) -> str:
     """Capture, optionally crop to region, and OCR to text."""
-    return get_ocr().extract_text(_crop_region(_capture_image(), region))
+    return get_ocr().extract_text(_crop_region(_capture_image(), region), lang=lang)
 
 
 def _do_set_baseline(region=None) -> dict:
@@ -392,17 +421,20 @@ def _do_screen_changed(threshold: float, region=None,
                     "baseline_created": True}
         return {"ok": False, "error": "no_baseline",
                 "detail": "Call set_screen_baseline first or pass auto_baseline=true."}
-    score = _diff_score(_baseline["image"], current)
+    score = _diff_score(_baseline["image"], current,
+                        get_config().get("screen_diff_pixel_delta"))
     return {"changed": score > threshold, "score": round(score, 4),
             "threshold": threshold}
 
 
 def _do_get_terminal_output(*, region=None, max_lines=None, max_chars=None,
-                            tail: bool = True) -> dict:
+                            tail: bool = True, lang=None) -> dict:
     cfg = get_config()
     max_lines = int(max_lines if max_lines is not None else cfg.get("terminal_max_lines"))
     max_chars = int(max_chars if max_chars is not None else cfg.get("terminal_max_chars"))
-    text = _ocr_region_text(region)
+    if region is None:
+        region = cfg.get("terminal_region")  # optional default bottom region
+    text = _ocr_region_text(region, lang=lang or cfg.get("ocr_fast_lang"))
     if _ocr_failed(text):
         return _compact_ocr_error(text)
     output, line_count, truncated = _compact_text(text, max_lines, max_chars, tail=tail)
@@ -412,8 +444,9 @@ def _do_get_terminal_output(*, region=None, max_lines=None, max_chars=None,
 
 async def _do_wait_for_text(client, *, text, match="contains", present=True,
                             timeout_seconds=None, poll_ms=None, region=None,
-                            min_confidence=0.0, max_chars=1000) -> dict:
+                            min_confidence=0.0, max_chars=1000, lang=None) -> dict:
     cfg = get_config()
+    lang = lang or cfg.get("ocr_fast_lang")
     timeout = min(float(timeout_seconds if timeout_seconds is not None
                         else cfg.get("wait_timeout_seconds")), _hard_max_wait())
     poll = (poll_ms if poll_ms is not None else cfg.get("wait_poll_ms")) / 1000.0
@@ -426,10 +459,11 @@ async def _do_wait_for_text(client, *, text, match="contains", present=True,
         attempts += 1
         if min_confidence and min_confidence > 0:
             els = get_ocr().extract_elements(
-                _crop_region(_capture_image(), region), min_confidence=min_confidence)
+                _crop_region(_capture_image(), region),
+                min_confidence=min_confidence, lang=lang)
             haystack = "\n".join(e["text"] for e in els)
         else:
-            haystack = _ocr_region_text(region)
+            haystack = _ocr_region_text(region, lang=lang)
         found, count = _match_text(haystack, text, match)
         satisfied = found if present else (not found)
         elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -462,13 +496,14 @@ async def _do_wait_for_screen_change(client, *, threshold=None, timeout_seconds=
         else:
             return {"ok": False, "error": "no_baseline",
                     "detail": "Call set_screen_baseline first or pass auto_baseline=true."}
+    pixel_delta = cfg.get("screen_diff_pixel_delta")
     start = time.monotonic()
     attempts = 0
     score = 0.0
     while True:
         attempts += 1
         current = _crop_region(_capture_image(), region)
-        score = _diff_score(_baseline["image"], current)
+        score = _diff_score(_baseline["image"], current, pixel_delta)
         elapsed_ms = int((time.monotonic() - start) * 1000)
         if score > threshold:
             if update_baseline_on_change:
@@ -624,20 +659,22 @@ async def _dispatch_task_action(client, action: str, args: dict) -> dict:
         return await _do_open_shell(
             client, shell=args.get("shell", "powershell"), distro=args.get("distro"),
             method=args.get("method", "win_r"), wait_seconds=args.get("wait_seconds"),
-            verify=args.get("verify", False))
+            verify=args.get("verify", True))
     if action in ("run_powershell_and_read", "run_wsl_and_read"):
         wait = min(float(args.get("wait_seconds", cfg.get("terminal_wait_seconds"))),
                    _hard_max_wait())
         max_lines = int(args.get("max_lines", cfg.get("terminal_max_lines")))
         max_chars = int(args.get("max_chars", cfg.get("terminal_max_chars")))
+        lang = args.get("lang")
         if action == "run_wsl_and_read":
             distro = args.get("distro") or cfg.get("default_wsl_distro")
             line = _build_wsl_command(args["command"], distro)
-            ok, out, tr = await _run_target_command(client, line, wait, max_lines, max_chars)
+            ok, out, tr = await _run_target_command(
+                client, line, wait, max_lines, max_chars, lang=lang)
             base = {"shell": "wsl", "distro": distro}
         else:
             ok, out, tr = await _run_target_command(
-                client, args["command"], wait, max_lines, max_chars)
+                client, args["command"], wait, max_lines, max_chars, lang=lang)
             base = {"shell": "powershell"}
         if not ok:
             return {"ok": False, "error": "ocr_failed", "detail": out, **base}
@@ -648,7 +685,7 @@ async def _dispatch_task_action(client, action: str, args: dict) -> dict:
             present=args.get("present", True), timeout_seconds=args.get("timeout_seconds"),
             poll_ms=args.get("poll_ms"), region=args.get("region"),
             min_confidence=float(args.get("min_confidence", 0.0)),
-            max_chars=int(args.get("max_chars", 1000)))
+            max_chars=int(args.get("max_chars", 1000)), lang=args.get("lang"))
     if action == "wait_for_screen_change":
         return await _do_wait_for_screen_change(
             client, threshold=args.get("threshold"),
@@ -658,7 +695,8 @@ async def _dispatch_task_action(client, action: str, args: dict) -> dict:
     if action == "get_terminal_output":
         return _do_get_terminal_output(
             region=args.get("region"), max_lines=args.get("max_lines"),
-            max_chars=args.get("max_chars"), tail=args.get("tail", True))
+            max_chars=args.get("max_chars"), tail=args.get("tail", True),
+            lang=args.get("lang"))
     if action == "screen_changed":
         return _do_screen_changed(
             float(args.get("threshold", cfg.get("screen_change_threshold"))),
@@ -694,6 +732,7 @@ def _brief_result(action: str, result: dict) -> str:
 
 async def _do_run_task_and_report(client, *, task="", steps, max_steps=10,
                                   timeout_seconds=None, stop_on_error=True,
+                                  stop_on_unverified=True,
                                   max_report_chars=2000) -> dict:
     cfg = get_config()
     budget = min(float(timeout_seconds if timeout_seconds is not None
@@ -733,6 +772,11 @@ async def _do_run_task_and_report(client, *, task="", steps, max_steps=10,
                 break
             continue
         steps_run += 1
+        # Treat an unverified shell as a failure so later steps don't run in the
+        # wrong window (avoids the focus/concatenation class of problems).
+        if (stop_on_unverified and action == "open_shell"
+                and isinstance(result, dict) and not result.get("verified")):
+            result["error"] = "shell_unverified"
         if isinstance(result, dict) and result.get("output"):
             final_output = result["output"]
         summary_parts.append(f"[{idx}] {action}: {_brief_result(action, result)}")
@@ -962,7 +1006,12 @@ async def list_tools() -> list[Tool]:
             description="Capture the target PC screen and extract text using OCR. Prefer this over capture_screen for text content.",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "lang": {
+                        "type": "string",
+                        "description": "OCR language override (e.g. 'eng', 'eng+jpn', 'eng+jpn+chi_sim'). Default from config ocr_lang (eng+jpn).",
+                    },
+                },
                 "required": [],
             },
         ),
@@ -979,6 +1028,10 @@ async def list_tools() -> list[Tool]:
                     "wait_seconds": {
                         "type": "number",
                         "description": "Seconds to wait for output (default: 1.0)",
+                    },
+                    "lang": {
+                        "type": "string",
+                        "description": "OCR language override. Default from config ocr_fast_lang (eng); pass 'eng+jpn' for Japanese output.",
                     },
                 },
                 "required": ["command"],
@@ -1104,6 +1157,10 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "integer"},
                         "description": "Optional [x, y, w, h] region to OCR.",
                     },
+                    "lang": {
+                        "type": "string",
+                        "description": "OCR language override (e.g. 'eng', 'eng+jpn', 'eng+jpn+chi_sim'). Default from config ocr_lang (eng+jpn).",
+                    },
                 },
                 "required": [],
             },
@@ -1130,6 +1187,10 @@ async def list_tools() -> list[Tool]:
                         "type": "array",
                         "items": {"type": "integer"},
                         "description": "Optional [x, y, w, h] region to OCR. Returned coordinates are full-frame.",
+                    },
+                    "lang": {
+                        "type": "string",
+                        "description": "OCR language override. Default from config ocr_lang (eng+jpn).",
                     },
                 },
                 "required": [],
@@ -1167,6 +1228,10 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "If true, return the chosen coordinate without clicking (default false).",
                     },
+                    "lang": {
+                        "type": "string",
+                        "description": "OCR language override. Default from config ocr_lang (eng+jpn).",
+                    },
                 },
                 "required": ["text"],
             },
@@ -1180,6 +1245,10 @@ async def list_tools() -> list[Tool]:
                     "command": {
                         "type": "string",
                         "description": "PowerShell command to type into the focused target shell.",
+                    },
+                    "lang": {
+                        "type": "string",
+                        "description": "OCR language override. Default from config ocr_fast_lang (eng); pass 'eng+jpn' for Japanese output.",
                     },
                     "wait_seconds": {
                         "type": "number",
@@ -1206,6 +1275,10 @@ async def list_tools() -> list[Tool]:
                     "command": {
                         "type": "string",
                         "description": "Linux command to run inside WSL bash -lc.",
+                    },
+                    "lang": {
+                        "type": "string",
+                        "description": "OCR language override. Default from config ocr_fast_lang (eng); pass 'eng+jpn' for Japanese output.",
                     },
                     "distro": {
                         "type": "string",
@@ -1265,7 +1338,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="wait_for_text",
-            description="Poll-OCR locally until text appears (or disappears). Avoids repeated model round-trips. Returns compact JSON, no image.",
+            description="Poll-OCR locally until text appears (or disappears). Avoids repeated model round-trips. Returns compact JSON, no image. NOTE: each poll is one capture+OCR, so the poll granularity equals OCR latency (slow with CJK); for fast gating use wait_for_screen_change first, then OCR. Defaults to ocr_fast_lang (eng); pass lang for CJK.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1300,13 +1373,17 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Max chars in returned text_excerpt (default 1000).",
                     },
+                    "lang": {
+                        "type": "string",
+                        "description": "OCR language override. Default from config ocr_fast_lang (eng); pass 'eng+jpn' to wait for Japanese text.",
+                    },
                 },
                 "required": ["text"],
             },
         ),
         Tool(
             name="wait_for_screen_change",
-            description="Poll a local image diff against the set_screen_baseline until the screen changes (or timeout). Returns compact JSON, no image.",
+            description="Poll a local image-diff (changed-pixel fraction) against set_screen_baseline until the screen changes (or timeout). Fast (no OCR) - use as a pre-gate before wait_for_text/OCR. Returns compact JSON, no image.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1341,7 +1418,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="cursor_crop",
-            description="Return a small image crop around a coordinate (or the best-effort tracked cursor). This is the only V2 tool that returns an image. Use after detect_text_elements/click_text when a small visual check is needed.",
+            description="Return a small image crop around a coordinate (or the best-effort tracked cursor). Only V2 tool that returns an image. FIRST USE: pass x/y, or call mouse_move/mouse_click/click_text first to set the tracked cursor; otherwise returns {ok:false,error:'cursor_unknown'} (the stack cannot read the real OS cursor).",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1386,6 +1463,10 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "Keep the last lines/chars (default true).",
                     },
+                    "lang": {
+                        "type": "string",
+                        "description": "OCR language override. Default from config ocr_fast_lang (eng); pass 'eng+jpn' for Japanese output.",
+                    },
                 },
                 "required": [],
             },
@@ -1413,6 +1494,10 @@ async def list_tools() -> list[Tool]:
                     "stop_on_error": {
                         "type": "boolean",
                         "description": "Stop at the first failing step (default true).",
+                    },
+                    "stop_on_unverified": {
+                        "type": "boolean",
+                        "description": "Treat an open_shell step with verified=false as a failure, so later steps don't run in the wrong window (default true).",
                     },
                     "max_report_chars": {
                         "type": "integer",
@@ -1559,15 +1644,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         elif name == "get_screen_text":
             image = _capture_image()
             _save_capture_log(image, "ocr")
-            text = get_ocr().extract_text(image)
+            lang = arguments.get("lang") or get_config().get("ocr_lang")
+            text = get_ocr().extract_text(image, lang=lang)
             return [TextContent(type="text", text=text)]
 
         elif name == "execute_and_read":
             command = arguments["command"]
             wait_seconds = arguments.get("wait_seconds", 1.0)
+            lang = arguments.get("lang") or get_config().get("ocr_fast_lang")
 
             # Raw mode: no tag interpretation for command text
             validate_chars(command)
+            _clear_input_line(client)
+            await asyncio.sleep(0.05)
             client.type_text(command, raw=True)
             await asyncio.sleep(0.1)
             client.send_key("enter")
@@ -1575,7 +1664,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
             image = _capture_image()
             _save_capture_log(image, "exec")
-            text = get_ocr().extract_text(image)
+            text = get_ocr().extract_text(image, lang=lang)
             return [TextContent(type="text", text=text)]
 
         elif name == "get_device_info":
@@ -1674,8 +1763,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             max_lines = int(arguments.get("max_lines", 40))
             max_chars = int(arguments.get("max_chars", 4000))
             region = arguments.get("region")
+            lang = arguments.get("lang") or get_config().get("ocr_lang")
             image = _crop_region(_capture_image(), region)
-            text = get_ocr().extract_text(image)
+            text = get_ocr().extract_text(image, lang=lang)
             if _ocr_failed(text):
                 return [TextContent(type="text", text=json.dumps(
                     _compact_ocr_error(text), ensure_ascii=False))]
@@ -1691,11 +1781,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             max_items = int(arguments.get("max_items", 100))
             min_conf = float(arguments.get("min_confidence", 0.0))
             region = arguments.get("region")
+            lang = arguments.get("lang") or get_config().get("ocr_lang")
             image = _capture_image()
             full_w, full_h = image.size
             cropped = _crop_region(image, region)
             off_x, off_y = (int(region[0]), int(region[1])) if region else (0, 0)
-            elements = get_ocr().extract_elements(cropped, min_confidence=min_conf)
+            elements = get_ocr().extract_elements(cropped, min_confidence=min_conf, lang=lang)
             for el in elements:
                 el["x"] += off_x
                 el["y"] += off_y
@@ -1717,9 +1808,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             index = int(arguments.get("index", 0))
             min_conf = float(arguments.get("min_confidence", 0.0))
             dry_run = arguments.get("dry_run", False)
+            lang = arguments.get("lang") or get_config().get("ocr_lang")
             image = _capture_image()
             img_w, img_h = image.size
-            elements = get_ocr().extract_elements(image, min_confidence=min_conf)
+            elements = get_ocr().extract_elements(image, min_confidence=min_conf, lang=lang)
             q = target.lower()
             if match == "exact":
                 matches = [e for e in elements if e["text"].lower() == q]
@@ -1762,7 +1854,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             max_lines = int(arguments.get("max_lines", cfg.get("terminal_max_lines")))
             max_chars = int(arguments.get("max_chars", cfg.get("terminal_max_chars")))
             ok, output, truncated = await _run_target_command(
-                client, command, wait_seconds, max_lines, max_chars
+                client, command, wait_seconds, max_lines, max_chars,
+                lang=arguments.get("lang")
             )
             if not ok:
                 return [TextContent(type="text", text=json.dumps({
@@ -1785,7 +1878,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             max_chars = int(arguments.get("max_chars", cfg.get("terminal_max_chars")))
             ps_line = _build_wsl_command(command, distro)
             ok, output, truncated = await _run_target_command(
-                client, ps_line, wait_seconds, max_lines, max_chars
+                client, ps_line, wait_seconds, max_lines, max_chars,
+                lang=arguments.get("lang")
             )
             if not ok:
                 return [TextContent(type="text", text=json.dumps({
@@ -1812,7 +1906,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 timeout_seconds=arguments.get("timeout_seconds"),
                 poll_ms=arguments.get("poll_ms"), region=arguments.get("region"),
                 min_confidence=float(arguments.get("min_confidence", 0.0)),
-                max_chars=int(arguments.get("max_chars", 1000)))
+                max_chars=int(arguments.get("max_chars", 1000)),
+                lang=arguments.get("lang"))
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
         elif name == "wait_for_screen_change":
@@ -1827,7 +1922,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         elif name == "get_terminal_output":
             result = _do_get_terminal_output(
                 region=arguments.get("region"), max_lines=arguments.get("max_lines"),
-                max_chars=arguments.get("max_chars"), tail=arguments.get("tail", True))
+                max_chars=arguments.get("max_chars"), tail=arguments.get("tail", True),
+                lang=arguments.get("lang"))
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
         elif name == "cursor_crop":
@@ -1850,6 +1946,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 max_steps=int(arguments.get("max_steps", 10)),
                 timeout_seconds=arguments.get("timeout_seconds"),
                 stop_on_error=arguments.get("stop_on_error", True),
+                stop_on_unverified=arguments.get("stop_on_unverified", True),
                 max_report_chars=int(arguments.get("max_report_chars", 2000)))
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
