@@ -21,9 +21,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/sunasaji/mcp-serial-hid-kvm"
-Repository = "https://github.com/sunasaji/mcp-serial-hid-kvm"
-Issues = "https://github.com/sunasaji/mcp-serial-hid-kvm/issues"
+Homepage = "https://github.com/cloudbt/mcp-serial-hid-kvm"
+Repository = "https://github.com/cloudbt/mcp-serial-hid-kvm"
+Issues = "https://github.com/cloudbt/mcp-serial-hid-kvm/issues"
 
 [project.scripts]
 mcp-serial-hid-kvm = "mcp_serial_hid_kvm.server:main"
