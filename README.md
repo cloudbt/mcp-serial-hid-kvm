@@ -114,6 +114,34 @@ Hardware settings (`SHKVM_SERIAL_PORT`, `SHKVM_SCREEN_WIDTH`, etc.) are configur
 | `set_capture_device` | Switch capture device |
 | `set_capture_resolution` | Change capture resolution |
 
+### Token-Efficient Wrapper Tools
+
+These layer on the same KVM client + local OCR and return **compact JSON, never
+images**. They move repeated loops, OCR post-processing, screen diffing, and
+coordinate lookup into local code so agents spend fewer tokens. Every
+text-returning tool is bounded (`max_lines` / `max_chars`) and every wait is
+capped (60 s).
+
+| Tool | Description |
+|------|-------------|
+| `health` | Compact readiness for the whole stack: `{ok, api, serial, video, ocr, capture_device, resolution, errors}` |
+| `set_screen_baseline` | Capture the current frame into an in-memory baseline. Optional `region` = `[x,y,w,h]`. Returns `{ok, width, height, timestamp}` |
+| `screen_changed` | Diff current frame vs. baseline. Returns only `{changed, score, threshold}`. `auto_baseline=true` seeds a baseline if none exists |
+| `get_screen_text_compact` | OCR the screen, normalize whitespace, bound by `max_lines`/`max_chars`. Returns `{text, line_count, truncated}` |
+| `detect_text_elements` | Tesseract TSV → text boxes `{text, x, y, w, h, confidence}` for local click targeting. Optional `query` substring filter, `min_confidence`, `region` |
+| `click_text` | Find text via OCR boxes and click its center. `match` = `contains`/`exact`, `index`, `dry_run=true` returns the coordinate without clicking |
+| `run_powershell_and_read` | Type a PowerShell command on the **target** via HID, wait, OCR the result. `{command, wait_seconds, max_lines, max_chars}` |
+| `run_wsl_and_read` | Same, wrapped as `wsl.exe -d <distro> -- bash -lc "<command>"`. `{command, distro, wait_seconds, max_lines, max_chars}` |
+
+**Command-tool limitations:** `run_powershell_and_read` / `run_wsl_and_read`
+drive the target purely through HID typing + screen OCR — there is no target-side
+agent. They assume a shell is **already focused** on the target. Correct
+delivery of special characters (notably the `"` used by the WSL wrapper) depends
+on the target keyboard layout matching the KVM server's `--target-layout`. On a
+mismatched layout (e.g. a JP-layout target with `us104`), double quotes may not
+arrive as ASCII straight quotes; prefer simple unquoted commands, or base64 for
+complex payloads. These tools never execute anything on the **host**.
+
 ## Architecture
 
 This package is intentionally minimal (~4 files):

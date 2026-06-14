@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 import pytesseract
+from pytesseract import Output
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,70 @@ class TerminalOCR:
         except Exception as e:
             logger.error(f"OCR failed: {e}")
             return f"[OCR Error: {str(e)}]"
+
+    def extract_elements(
+        self,
+        image: Image.Image,
+        preprocess: bool = True,
+        min_confidence: float = 0.0,
+    ) -> list[dict]:
+        """Extract text elements with bounding boxes using Tesseract TSV output.
+
+        Coordinates are mapped back to the *original* ``image`` pixel space, so
+        callers can use them directly for click targeting.
+
+        Args:
+            image: PIL Image (capture frame, original resolution).
+            preprocess: Apply the same preprocessing used by ``extract_text``.
+            min_confidence: Drop elements below this confidence (0.0-1.0).
+
+        Returns:
+            List of dicts: ``{"text", "x", "y", "w", "h", "confidence"}`` where
+            confidence is 0.0-1.0. Empty/whitespace-only tokens are skipped.
+        """
+        if preprocess:
+            processed = self.preprocess_image(image)
+        else:
+            processed = image
+
+        # preprocess_image upscales the frame; map coordinates back to the
+        # original frame so click targeting matches screen pixels.
+        scale_x = image.width / processed.width if processed.width else 1.0
+        scale_y = image.height / processed.height if processed.height else 1.0
+
+        try:
+            data = pytesseract.image_to_data(
+                processed,
+                lang=self.tesseract_lang,
+                config=self.tesseract_config,
+                output_type=Output.DICT,
+            )
+        except Exception as e:
+            logger.error(f"OCR (elements) failed: {e}")
+            return []
+
+        elements: list[dict] = []
+        count = len(data.get("text", []))
+        for i in range(count):
+            text = (data["text"][i] or "").strip()
+            if not text:
+                continue
+            try:
+                conf_raw = float(data["conf"][i])
+            except (ValueError, TypeError):
+                conf_raw = -1.0
+            confidence = conf_raw / 100.0 if conf_raw >= 0 else 0.0
+            if confidence < min_confidence:
+                continue
+            elements.append({
+                "text": text,
+                "x": int(round(data["left"][i] * scale_x)),
+                "y": int(round(data["top"][i] * scale_y)),
+                "w": int(round(data["width"][i] * scale_x)),
+                "h": int(round(data["height"][i] * scale_y)),
+                "confidence": round(confidence, 2),
+            })
+        return elements
 
     def _postprocess_text(self, text: str) -> str:
         """Clean up OCR output."""

@@ -16,7 +16,7 @@ from typing import Any
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import ImageContent, TextContent, Tool
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 from serial_hid_kvm.client import KvmClient, KvmClientError
 from serial_hid_kvm.hid_keycodes import validate_chars
 
@@ -29,6 +29,124 @@ logger = logging.getLogger(__name__)
 # Global instances
 _client: KvmClient | None = None
 _ocr: TerminalOCR | None = None
+
+# In-memory screen baseline for screen_changed (set by set_screen_baseline).
+# Holds {"image": PIL.Image (grayscale), "width", "height", "timestamp", "region"}.
+_baseline: dict | None = None
+
+# Cached target screen size (for mapping OCR pixels -> click coordinates).
+_screen_size: tuple[int, int] | None = None
+
+# Hard ceiling on any wait/timeout exposed by the wrapper command tools.
+MAX_WAIT_SECONDS = 60.0
+
+
+# ---------------------------------------------------------------------------
+# Wrapper-tool helpers (pure logic, unit-testable without hardware)
+# ---------------------------------------------------------------------------
+
+def _normalize_lines(text: str) -> list[str]:
+    """Strip trailing whitespace, collapse blank runs, trim edge blanks."""
+    lines = [line.rstrip() for line in text.splitlines()]
+    cleaned: list[str] = []
+    blank_run = 0
+    for line in lines:
+        if not line.strip():
+            blank_run += 1
+            if blank_run > 1:
+                continue
+        else:
+            blank_run = 0
+        cleaned.append(line)
+    while cleaned and not cleaned[0].strip():
+        cleaned.pop(0)
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    return cleaned
+
+
+def _compact_text(
+    text: str,
+    max_lines: int,
+    max_chars: int,
+    tail: bool = False,
+) -> tuple[str, int, bool]:
+    """Bound OCR text by line and character count.
+
+    Args:
+        text: Raw OCR text.
+        max_lines: Maximum number of lines to keep (<=0 disables the limit).
+        max_chars: Maximum number of characters to keep (<=0 disables).
+        tail: If True keep the last lines/chars (command output lives at the
+            bottom of a terminal); otherwise keep from the top.
+
+    Returns:
+        ``(compact_text, line_count, truncated)``.
+    """
+    lines = _normalize_lines(text)
+    truncated = False
+    if max_lines and max_lines > 0 and len(lines) > max_lines:
+        lines = lines[-max_lines:] if tail else lines[:max_lines]
+        truncated = True
+    out = "\n".join(lines)
+    if max_chars and max_chars > 0 and len(out) > max_chars:
+        out = out[-max_chars:] if tail else out[:max_chars]
+        truncated = True
+    return out, len(lines), truncated
+
+
+def _crop_region(image: Image.Image, region: Any) -> Image.Image:
+    """Crop ``image`` to ``region`` = [x, y, w, h]; return image if region is falsy."""
+    if not region:
+        return image
+    try:
+        x, y, w, h = (int(v) for v in region)
+    except (TypeError, ValueError):
+        return image
+    x = max(0, min(x, image.width))
+    y = max(0, min(y, image.height))
+    right = max(x, min(x + w, image.width))
+    bottom = max(y, min(y + h, image.height))
+    return image.crop((x, y, right, bottom))
+
+
+def _ocr_failed(text: str) -> bool:
+    """True if extract_text returned its error sentinel."""
+    return text.startswith("[OCR Error:")
+
+
+def _compact_ocr_error(text: str, limit: int = 200) -> dict:
+    """Build a compact error payload from an OCR error sentinel (no traceback dump)."""
+    detail = text[len("[OCR Error:"):].rstrip("]").strip()
+    detail = " ".join(detail.split())
+    if len(detail) > limit:
+        detail = detail[:limit] + "..."
+    return {"ok": False, "error": "ocr_failed", "detail": detail}
+
+
+def _diff_score(img_a: Image.Image, img_b: Image.Image) -> float:
+    """Mean absolute grayscale difference between two images, normalized 0..1."""
+    a = img_a.convert("L")
+    b = img_b.convert("L")
+    if a.size != b.size:
+        b = b.resize(a.size)
+    diff = ImageChops.difference(a, b)
+    return ImageStat.Stat(diff).mean[0] / 255.0
+
+
+def _escape_ps_double_quotes(text: str) -> str:
+    """Escape double quotes for a PowerShell double-quoted string (backtick)."""
+    return text.replace('"', '`"')
+
+
+def _build_wsl_command(command: str, distro: str) -> str:
+    """Build a PowerShell line that runs *command* in WSL *distro*.
+
+    Shape: ``wsl.exe -d <distro> -- bash -lc "<escaped command>"``.
+    Embedded double quotes are backtick-escaped for PowerShell. Complex
+    quoting is unreliable in the MVP; prefer simple commands or base64.
+    """
+    return f'wsl.exe -d {distro} -- bash -lc "{_escape_ps_double_quotes(command)}"'
 
 
 def get_client() -> KvmClient:
@@ -71,6 +189,102 @@ def _capture_image(quality: int = 85) -> Image.Image:
     """Fetch a frame from KVM server and return as PIL Image."""
     jpeg_bytes, w, h = get_client().capture_frame_jpeg(quality)
     return Image.open(io.BytesIO(jpeg_bytes))
+
+
+def _get_screen_size() -> tuple[int, int]:
+    """Target screen size (cached) used to map OCR pixels to click coordinates."""
+    global _screen_size
+    if _screen_size is None:
+        try:
+            cfg = get_client().get_device_info().get("config", {})
+            _screen_size = (
+                int(cfg.get("screen_width", 1920)),
+                int(cfg.get("screen_height", 1080)),
+            )
+        except Exception:
+            _screen_size = (1920, 1080)
+    return _screen_size
+
+
+def _do_health(client: KvmClient) -> dict:
+    """Compact readiness snapshot for API / serial / video / OCR."""
+    errors: list[str] = []
+    api_ok = serial_ok = video_ok = ocr_ok = False
+    capture_device = None
+    resolution = None
+
+    try:
+        client.ping()
+        api_ok = True
+    except Exception as e:
+        errors.append(f"api: {e}")
+
+    if api_ok:
+        try:
+            info = client.get_device_info()
+            serial = info.get("serial", {})
+            serial_ok = bool(serial.get("connected"))
+            if not serial_ok and serial.get("error"):
+                errors.append(f"serial: {serial['error']}")
+            cap = info.get("capture", {})
+            if cap and not cap.get("error"):
+                video_ok = True
+                capture_device = (
+                    str(cap.get("device")) if cap.get("device") is not None else None
+                )
+                w, h = cap.get("width"), cap.get("height")
+                if w and h:
+                    resolution = f"{w}x{h}"
+            elif cap.get("error"):
+                errors.append(f"video: {cap['error']}")
+        except Exception as e:
+            errors.append(f"device_info: {e}")
+
+    try:
+        import pytesseract
+        get_ocr()  # ensures tesseract_cmd / PATH are configured
+        pytesseract.get_tesseract_version()
+        ocr_ok = True
+    except Exception as e:
+        errors.append(f"ocr: {e}")
+
+    return {
+        "ok": api_ok and serial_ok and video_ok and ocr_ok,
+        "api": api_ok,
+        "serial": serial_ok,
+        "video": video_ok,
+        "ocr": ocr_ok,
+        "capture_device": capture_device,
+        "resolution": resolution,
+        "errors": errors,
+    }
+
+
+async def _run_target_command(
+    client: KvmClient,
+    command: str,
+    wait_seconds: float,
+    max_lines: int,
+    max_chars: int,
+) -> tuple[bool, str, bool]:
+    """Type *command* into the focused target shell, wait, OCR, return tail output.
+
+    Returns ``(ok, output_or_error_detail, truncated)``. The command text is
+    sent in raw mode (no {tag} interpretation) followed by Enter. ``ok`` is
+    False only when OCR itself failed (output holds a compact error detail).
+    """
+    validate_chars(command)
+    client.type_text(command, raw=True)
+    await asyncio.sleep(0.1)
+    client.send_key("enter")
+    await asyncio.sleep(max(0.0, min(wait_seconds, MAX_WAIT_SECONDS)))
+    image = _capture_image()
+    text = get_ocr().extract_text(image)
+    if _ocr_failed(text):
+        err = _compact_ocr_error(text)
+        return False, err["detail"], False
+    output, _line_count, truncated = _compact_text(text, max_lines, max_chars, tail=True)
+    return True, output, truncated
 
 
 # Create MCP server
@@ -358,6 +572,199 @@ async def list_tools() -> list[Tool]:
                 "required": ["device"],
             },
         ),
+        # -------------------------------------------------------------------
+        # Token-efficient wrapper tools (Route A MVP). These layer on top of
+        # the same KVM client + local OCR and return compact JSON (no images).
+        # -------------------------------------------------------------------
+        Tool(
+            name="health",
+            description="Compact readiness check for the whole stack (API, serial, video, OCR). Returns small JSON, never an image.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        Tool(
+            name="set_screen_baseline",
+            description="Capture the current frame and store it in memory as the baseline for screen_changed. Returns ok/width/height/timestamp (no image).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "region": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional [x, y, w, h] region to baseline. Omit for full frame.",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="screen_changed",
+            description="Compare the current frame to the baseline and return only {changed, score, threshold}. No image. Set auto_baseline=true to create a baseline if none exists.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "threshold": {
+                        "type": "number",
+                        "description": "Change threshold 0..1 (default 0.02). changed = score > threshold.",
+                    },
+                    "region": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional [x, y, w, h] region to compare.",
+                    },
+                    "auto_baseline": {
+                        "type": "boolean",
+                        "description": "If true and no baseline exists, set one and report changed=false (default false).",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_screen_text_compact",
+            description="OCR the current screen and return whitespace-normalized, bounded text (no image). Use instead of get_screen_text for token efficiency.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Maximum lines to return (default 40).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Maximum characters to return (default 4000).",
+                    },
+                    "region": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional [x, y, w, h] region to OCR.",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="detect_text_elements",
+            description="OCR the screen with Tesseract TSV and return text elements with bounding boxes for local click targeting. Compact JSON, no image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional case-insensitive substring filter on element text.",
+                    },
+                    "max_items": {
+                        "type": "integer",
+                        "description": "Maximum elements to return (default 100).",
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Minimum OCR confidence 0..1 (default 0.0).",
+                    },
+                    "region": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional [x, y, w, h] region to OCR. Returned coordinates are full-frame.",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="click_text",
+            description="Find text on screen via OCR bounding boxes and click its center. Supports dry_run=true to return the coordinate without clicking.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to find.",
+                    },
+                    "match": {
+                        "type": "string",
+                        "enum": ["contains", "exact"],
+                        "description": "Match mode (default contains).",
+                    },
+                    "button": {
+                        "type": "string",
+                        "enum": ["left", "right", "middle"],
+                        "description": "Mouse button (default left).",
+                    },
+                    "index": {
+                        "type": "integer",
+                        "description": "Which match to click when several match (default 0).",
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Minimum OCR confidence 0..1 (default 0.0).",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, return the chosen coordinate without clicking (default false).",
+                    },
+                },
+                "required": ["text"],
+            },
+        ),
+        Tool(
+            name="run_powershell_and_read",
+            description="Run a PowerShell command on the TARGET PC via KVM keyboard input, wait, then OCR the screen and return compact output. Assumes a PowerShell prompt is focused on the target. Does NOT execute anything on the host.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "PowerShell command to type into the focused target shell.",
+                    },
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": "Seconds to wait for output before OCR (default 2, max 60).",
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Maximum output lines to return (default 30).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Maximum output characters to return (default 3000).",
+                    },
+                },
+                "required": ["command"],
+            },
+        ),
+        Tool(
+            name="run_wsl_and_read",
+            description='Run a Linux command on the TARGET via WSL by typing `wsl.exe -d <distro> -- bash -lc "<command>"` into the focused target PowerShell, then OCR the result. Embedded double quotes are backtick-escaped; complex quoting is unreliable. Does NOT execute anything on the host.',
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Linux command to run inside WSL bash -lc.",
+                    },
+                    "distro": {
+                        "type": "string",
+                        "description": "WSL distro name (default Ubuntu-24.04).",
+                    },
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": "Seconds to wait for output before OCR (default 2, max 60).",
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Maximum output lines to return (default 30).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Maximum output characters to return (default 3000).",
+                    },
+                },
+                "required": ["command"],
+            },
+        ),
     ]
 
 
@@ -508,6 +915,181 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 type="text",
                 text=f"Switched to device {device}: {cap_info.get('width')}x{cap_info.get('height')} ({cap_info.get('backend')})",
             )]
+
+        elif name == "health":
+            result = _do_health(client)
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "set_screen_baseline":
+            global _baseline
+            region = arguments.get("region")
+            image = _capture_image()
+            cropped = _crop_region(image, region)
+            ts = datetime.datetime.now().isoformat(timespec="seconds")
+            _baseline = {
+                "image": cropped.convert("L"),
+                "width": cropped.width,
+                "height": cropped.height,
+                "timestamp": ts,
+                "region": region,
+            }
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True,
+                "width": cropped.width,
+                "height": cropped.height,
+                "timestamp": ts,
+            }, ensure_ascii=False))]
+
+        elif name == "screen_changed":
+            threshold = float(arguments.get("threshold", 0.02))
+            region = arguments.get("region")
+            auto_baseline = arguments.get("auto_baseline", False)
+            image = _capture_image()
+            current = _crop_region(image, region)
+            if _baseline is None:
+                if auto_baseline:
+                    ts = datetime.datetime.now().isoformat(timespec="seconds")
+                    _baseline = {
+                        "image": current.convert("L"),
+                        "width": current.width,
+                        "height": current.height,
+                        "timestamp": ts,
+                        "region": region,
+                    }
+                    return [TextContent(type="text", text=json.dumps({
+                        "changed": False, "score": 0.0, "threshold": threshold,
+                        "baseline_created": True,
+                    }, ensure_ascii=False))]
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False, "error": "no_baseline",
+                    "detail": "Call set_screen_baseline first or pass auto_baseline=true.",
+                }, ensure_ascii=False))]
+            score = _diff_score(_baseline["image"], current)
+            return [TextContent(type="text", text=json.dumps({
+                "changed": score > threshold,
+                "score": round(score, 4),
+                "threshold": threshold,
+            }, ensure_ascii=False))]
+
+        elif name == "get_screen_text_compact":
+            max_lines = int(arguments.get("max_lines", 40))
+            max_chars = int(arguments.get("max_chars", 4000))
+            region = arguments.get("region")
+            image = _crop_region(_capture_image(), region)
+            text = get_ocr().extract_text(image)
+            if _ocr_failed(text):
+                return [TextContent(type="text", text=json.dumps(
+                    _compact_ocr_error(text), ensure_ascii=False))]
+            compact, line_count, truncated = _compact_text(text, max_lines, max_chars)
+            return [TextContent(type="text", text=json.dumps({
+                "text": compact,
+                "line_count": line_count,
+                "truncated": truncated,
+            }, ensure_ascii=False))]
+
+        elif name == "detect_text_elements":
+            query = arguments.get("query")
+            max_items = int(arguments.get("max_items", 100))
+            min_conf = float(arguments.get("min_confidence", 0.0))
+            region = arguments.get("region")
+            image = _capture_image()
+            full_w, full_h = image.size
+            cropped = _crop_region(image, region)
+            off_x, off_y = (int(region[0]), int(region[1])) if region else (0, 0)
+            elements = get_ocr().extract_elements(cropped, min_confidence=min_conf)
+            for el in elements:
+                el["x"] += off_x
+                el["y"] += off_y
+            if query:
+                q = query.lower()
+                elements = [e for e in elements if q in e["text"].lower()]
+            if max_items > 0:
+                elements = elements[:max_items]
+            return [TextContent(type="text", text=json.dumps({
+                "elements": elements,
+                "width": full_w,
+                "height": full_h,
+            }, ensure_ascii=False))]
+
+        elif name == "click_text":
+            target = arguments["text"]
+            match = arguments.get("match", "contains")
+            button = arguments.get("button", "left")
+            index = int(arguments.get("index", 0))
+            min_conf = float(arguments.get("min_confidence", 0.0))
+            dry_run = arguments.get("dry_run", False)
+            image = _capture_image()
+            img_w, img_h = image.size
+            elements = get_ocr().extract_elements(image, min_confidence=min_conf)
+            q = target.lower()
+            if match == "exact":
+                matches = [e for e in elements if e["text"].lower() == q]
+            else:
+                matches = [e for e in elements if q in e["text"].lower()]
+            if not matches:
+                return [TextContent(type="text", text=json.dumps({
+                    "clicked": False, "text": target, "match_count": 0,
+                    "error": "text_not_found",
+                }, ensure_ascii=False))]
+            if index < 0 or index >= len(matches):
+                return [TextContent(type="text", text=json.dumps({
+                    "clicked": False, "text": target, "match_count": len(matches),
+                    "error": "index_out_of_range",
+                }, ensure_ascii=False))]
+            el = matches[index]
+            cx = el["x"] + el["w"] // 2
+            cy = el["y"] + el["h"] // 2
+            screen_w, screen_h = _get_screen_size()
+            sx = int(round(cx * screen_w / img_w)) if img_w else cx
+            sy = int(round(cy * screen_h / img_h)) if img_h else cy
+            if dry_run:
+                return [TextContent(type="text", text=json.dumps({
+                    "clicked": False, "dry_run": True, "text": el["text"],
+                    "x": sx, "y": sy, "match_count": len(matches),
+                }, ensure_ascii=False))]
+            client.mouse_click(button, sx, sy)
+            return [TextContent(type="text", text=json.dumps({
+                "clicked": True, "text": el["text"],
+                "x": sx, "y": sy, "match_count": len(matches),
+            }, ensure_ascii=False))]
+
+        elif name == "run_powershell_and_read":
+            command = arguments["command"]
+            wait_seconds = min(float(arguments.get("wait_seconds", 2.0)), MAX_WAIT_SECONDS)
+            max_lines = int(arguments.get("max_lines", 30))
+            max_chars = int(arguments.get("max_chars", 3000))
+            ok, output, truncated = await _run_target_command(
+                client, command, wait_seconds, max_lines, max_chars
+            )
+            if not ok:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False, "shell": "powershell",
+                    "error": "ocr_failed", "detail": output,
+                }, ensure_ascii=False))]
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True, "shell": "powershell",
+                "output": output, "truncated": truncated,
+            }, ensure_ascii=False))]
+
+        elif name == "run_wsl_and_read":
+            command = arguments["command"]
+            distro = arguments.get("distro", "Ubuntu-24.04")
+            wait_seconds = min(float(arguments.get("wait_seconds", 2.0)), MAX_WAIT_SECONDS)
+            max_lines = int(arguments.get("max_lines", 30))
+            max_chars = int(arguments.get("max_chars", 3000))
+            ps_line = _build_wsl_command(command, distro)
+            ok, output, truncated = await _run_target_command(
+                client, ps_line, wait_seconds, max_lines, max_chars
+            )
+            if not ok:
+                return [TextContent(type="text", text=json.dumps({
+                    "ok": False, "shell": "wsl", "distro": distro,
+                    "error": "ocr_failed", "detail": output,
+                }, ensure_ascii=False))]
+            return [TextContent(type="text", text=json.dumps({
+                "ok": True, "shell": "wsl", "distro": distro,
+                "output": output, "truncated": truncated,
+            }, ensure_ascii=False))]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
