@@ -7,6 +7,7 @@ via TCP.  OCR is run locally using frames fetched from the KVM server.
 import asyncio
 import base64
 import datetime
+import hashlib
 import io
 import json
 import logging
@@ -793,6 +794,165 @@ async def _do_run_task_and_report(client, *, task="", steps, max_steps=10,
             "final_output_excerpt": fo_excerpt}
 
 
+# ---------------------------------------------------------------------------
+# paste_unicode_text helpers
+# ---------------------------------------------------------------------------
+
+_PASTE_CMD_MAX = 7500
+
+
+def _paste_unicode_build_command(text: str) -> tuple[str, str, bytes]:
+    """Build a PowerShell one-liner that decodes Base64URL text and sets the clipboard.
+
+    Returns (command, payload, utf8_bytes).  command is pure ASCII printable.
+    payload is the Base64URL string with padding stripped.
+    """
+    utf8_bytes = text.encode("utf-8")
+    payload = base64.urlsafe_b64encode(utf8_bytes).decode("ascii").rstrip("=")
+    command = (
+        f"$b='{payload}';"
+        "$b=$b.Replace('-','+').Replace('_','/');"
+        "while($b.Length%4){$b+='='};"
+        "$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b));"
+        "Set-Clipboard -Value $s;"
+        "Write-Output ('PASTE_UNICODE_OK chars='+$s.Length)"
+    )
+    return command, payload, utf8_bytes
+
+
+def _paste_unicode_estimate_seconds(
+    n_chars: int, type_key_ms: int, type_inter_key_ms: int
+) -> float:
+    """Estimate HID typing time in seconds for n_chars at given per-key timing."""
+    return round(n_chars * (type_key_ms + type_inter_key_ms) / 1000.0, 1)
+
+
+async def _do_paste_unicode_text(
+    client: KvmClient,
+    *,
+    text: str,
+    focus_shell: bool = True,
+    paste_after_set: bool = False,
+    restore_focus_with_alt_tab: bool = False,
+    wait_seconds: float = 1.0,
+    fast_timing: bool = True,
+    type_key_ms: int = 5,
+    type_inter_key_ms: int = 5,
+    type_shift_ms: int = 0,
+    max_text_chars: int = 1200,
+    dry_run: bool = False,
+) -> dict:
+    """Encode text as Base64URL, type the PowerShell decode+Set-Clipboard command
+    into the target, and optionally paste with Ctrl+V.
+    """
+    if not text:
+        return {"ok": False, "error": "empty_text"}
+    if len(text) > max_text_chars:
+        return {"ok": False, "error": "text_too_long",
+                "text_chars": len(text), "max_text_chars": max_text_chars}
+
+    command, payload, utf8_bytes = _paste_unicode_build_command(text)
+
+    if len(command) > _PASTE_CMD_MAX:
+        return {
+            "ok": False,
+            "error": "command_too_long",
+            "command_chars": len(command),
+            "max_command_chars": _PASTE_CMD_MAX,
+            "detail": "Use transfer_unicode_file for large texts.",
+        }
+
+    sha256 = hashlib.sha256(utf8_bytes).hexdigest()
+    cfg = get_config()
+    eff_key_ms = type_key_ms if fast_timing else cfg.get("type_key_ms")
+    eff_inter_ms = type_inter_key_ms if fast_timing else cfg.get("type_inter_key_ms")
+    estimated_s = _paste_unicode_estimate_seconds(len(command), eff_key_ms, eff_inter_ms)
+
+    meta: dict = {
+        "text_chars": len(text),
+        "utf8_bytes": len(utf8_bytes),
+        "payload_chars": len(payload),
+        "command_chars": len(command),
+        "sha256": sha256,
+        "estimated_type_seconds": estimated_s,
+        "timing_used": {
+            "type_key_ms": type_key_ms,
+            "type_inter_key_ms": type_inter_key_ms,
+            "type_shift_ms": type_shift_ms,
+        } if fast_timing else None,
+        "focus_shell": focus_shell,
+    }
+
+    if dry_run:
+        return {"ok": True, "dry_run": True, "set_clipboard": False, "pasted": False,
+                **meta, "verified": False, "warning": None}
+
+    if focus_shell:
+        await _do_open_shell(client, shell="powershell", verify=False)
+
+    old_timing = None
+    timing_warning = None
+    if fast_timing:
+        try:
+            old_timing = client.get_timing()
+            client.set_timing({
+                "char_delay": type_inter_key_ms / 1000.0,
+                "type_key_hold": type_key_ms / 1000.0,
+                "type_shift": type_shift_ms / 1000.0,
+            })
+        except KvmClientError as e:
+            timing_warning = f"fast_timing not applied: {e}"
+            old_timing = None
+
+    verified = False
+    pasted = False
+    warnings: list[str] = []
+    if timing_warning:
+        warnings.append(timing_warning)
+
+    try:
+        _clear_input_line(client)
+        await asyncio.sleep(0.05)
+        client.type_text(command, raw=True)
+        await asyncio.sleep(0.1)
+        client.send_key("enter")
+        await asyncio.sleep(max(0.0, min(wait_seconds, _hard_max_wait())))
+
+        try:
+            ocr_text = get_ocr().extract_text(
+                _capture_image(), lang=cfg.get("ocr_fast_lang"))
+            if not _ocr_failed(ocr_text) and "PASTE_UNICODE_OK" in ocr_text:
+                verified = True
+        except Exception:
+            pass  # OCR failure is non-fatal
+
+        if paste_after_set:
+            if restore_focus_with_alt_tab:
+                client.send_key("tab", ["alt"])
+                await asyncio.sleep(0.3)
+            client.send_key("v", ["ctrl"])
+            pasted = True
+            if not restore_focus_with_alt_tab:
+                warnings.append(
+                    "Ctrl+V sent; focus may still be PowerShell unless moved by caller.")
+
+    finally:
+        if old_timing is not None:
+            try:
+                client.set_timing(old_timing)
+            except KvmClientError as e:
+                warnings.append(f"timing restore failed: {e}")
+
+    return {
+        "ok": True,
+        "set_clipboard": True,
+        "pasted": pasted,
+        **meta,
+        "verified": verified,
+        "warning": "; ".join(warnings) if warnings else None,
+    }
+
+
 # Create MCP server
 app = Server("mcp-serial-hid-kvm")
 
@@ -1543,6 +1703,68 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        # -------------------------------------------------------------------
+        # Unicode / clipboard transfer
+        # -------------------------------------------------------------------
+        Tool(
+            name="paste_unicode_text",
+            description=(
+                "Transfer Unicode text (Japanese, Chinese, etc.) to the Target clipboard "
+                "via UTF-8 Base64URL typed through PowerShell. Optionally paste with Ctrl+V. "
+                "Good for short/medium text (1-500 CJK chars ≈ 2-22 s at fast_timing). "
+                "Large text is slow over HID; use transfer_unicode_file for > 1000 chars."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Unicode text to set on the Target clipboard. Supports Japanese, Chinese, English, newlines, and symbols.",
+                    },
+                    "focus_shell": {
+                        "type": "boolean",
+                        "description": "Open/focus Target PowerShell before setting clipboard (default true).",
+                    },
+                    "paste_after_set": {
+                        "type": "boolean",
+                        "description": "After setting the clipboard, send Ctrl+V (default false; focus is still PowerShell after this tool unless you moved it).",
+                    },
+                    "restore_focus_with_alt_tab": {
+                        "type": "boolean",
+                        "description": "If paste_after_set=true, send Alt+Tab before Ctrl+V to return to the previous app (default false).",
+                    },
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": "Seconds to wait after executing the PowerShell clipboard command (default 1.0).",
+                    },
+                    "fast_timing": {
+                        "type": "boolean",
+                        "description": "Temporarily speed up HID typing for the Base64 payload, then restore prior timing (default true).",
+                    },
+                    "type_key_ms": {
+                        "type": "integer",
+                        "description": "Per-key hold in ms when fast_timing=true (default 5).",
+                    },
+                    "type_inter_key_ms": {
+                        "type": "integer",
+                        "description": "Inter-key delay in ms when fast_timing=true (default 5).",
+                    },
+                    "type_shift_ms": {
+                        "type": "integer",
+                        "description": "Shift/modifier staging delay in ms when fast_timing=true (default 0).",
+                    },
+                    "max_text_chars": {
+                        "type": "integer",
+                        "description": "Safety cap for Unicode character count (default 1200).",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Return size/estimate metadata without typing anything (default false).",
+                    },
+                },
+                "required": ["text"],
+            },
+        ),
     ]
 
 
@@ -1963,6 +2185,23 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
         elif name == "get_timing":
             result = _do_get_timing(client, include_source=arguments.get("include_source", True))
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "paste_unicode_text":
+            result = await _do_paste_unicode_text(
+                client,
+                text=arguments["text"],
+                focus_shell=arguments.get("focus_shell", True),
+                paste_after_set=arguments.get("paste_after_set", False),
+                restore_focus_with_alt_tab=arguments.get("restore_focus_with_alt_tab", False),
+                wait_seconds=float(arguments.get("wait_seconds", 1.0)),
+                fast_timing=arguments.get("fast_timing", True),
+                type_key_ms=int(arguments.get("type_key_ms", 5)),
+                type_inter_key_ms=int(arguments.get("type_inter_key_ms", 5)),
+                type_shift_ms=int(arguments.get("type_shift_ms", 0)),
+                max_text_chars=int(arguments.get("max_text_chars", 1200)),
+                dry_run=arguments.get("dry_run", False),
+            )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
         else:

@@ -332,3 +332,57 @@ def test_extract_text_accepts_lang_override():
     # explicit eng override must not raise and should read ASCII text
     txt = TerminalOCR().extract_text(img, lang="eng")
     assert "hello" in txt.lower()
+
+
+# --- paste_unicode_text helpers --------------------------------------------
+
+def test_paste_unicode_command_is_pure_ascii():
+    cmd, payload, _ = srv._paste_unicode_build_command("日本語テスト")
+    assert cmd.isascii(), "command must contain only ASCII"
+    assert payload.isascii(), "payload must contain only ASCII"
+
+
+def test_paste_unicode_command_excludes_original_text():
+    text = "日本語テストと中文测试"
+    cmd, _, _ = srv._paste_unicode_build_command(text)
+    for ch in text:
+        assert ch not in cmd, f"Original character {ch!r} found in command"
+
+
+def test_paste_unicode_command_has_set_clipboard():
+    cmd, _, _ = srv._paste_unicode_build_command("hello")
+    assert "Set-Clipboard" in cmd
+
+
+def test_paste_unicode_command_restores_base64_padding():
+    cmd, _, _ = srv._paste_unicode_build_command("test")
+    assert "while($b.Length%4){$b+='='}" in cmd
+
+
+def test_paste_unicode_payload_roundtrip():
+    import base64
+    text = "日本語テストと中文测试 ABC 123"
+    _, payload, utf8_bytes = srv._paste_unicode_build_command(text)
+    # Re-add padding and decode
+    padded = payload + "=" * ((-len(payload)) % 4)
+    # Base64URL -> standard Base64
+    standard = padded.replace("-", "+").replace("_", "/")
+    decoded = base64.b64decode(standard).decode("utf-8")
+    assert decoded == text
+
+
+def test_paste_unicode_command_length_within_safety_cap():
+    # 1200 CJK chars (max default) must not exceed the 7500-char hard limit.
+    text = "亜" * 1200
+    cmd, _, _ = srv._paste_unicode_build_command(text)
+    assert len(cmd) <= srv._PASTE_CMD_MAX
+
+
+def test_paste_unicode_estimate_seconds_basic():
+    # 100 chars at 5+5 ms/char = 1.0 s
+    assert srv._paste_unicode_estimate_seconds(100, 5, 5) == 1.0
+
+
+def test_paste_unicode_estimate_seconds_normal_timing():
+    # 1000 chars at 20+20 ms/char = 40.0 s
+    assert srv._paste_unicode_estimate_seconds(1000, 20, 20) == 40.0
