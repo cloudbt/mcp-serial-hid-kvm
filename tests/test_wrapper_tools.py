@@ -4,10 +4,13 @@ These cover the pure logic (text bounding, image diff, WSL command shaping)
 and structured OCR, without requiring KVM hardware or a running API server.
 """
 
+import os
+
 from PIL import Image, ImageDraw, ImageFont
 
 import mcp_serial_hid_kvm.server as srv
 from mcp_serial_hid_kvm.ocr import TerminalOCR
+from mcp_serial_hid_kvm.runtime_config import DEFAULTS, RuntimeConfig
 
 
 def test_normalize_lines_collapses_blanks_and_trims_edges():
@@ -113,3 +116,139 @@ def test_extract_elements_returns_boxes():
         # coordinates mapped back into the original frame
         assert 0 <= e["x"] <= img.width
         assert 0 <= e["y"] <= img.height
+
+
+# --- V2: text matching -----------------------------------------------------
+
+def test_match_text_contains_is_case_insensitive():
+    assert srv._match_text("Hello World", "world", "contains") == (True, 1)
+
+
+def test_match_text_contains_counts_occurrences():
+    assert srv._match_text("a a a", "a", "contains") == (True, 3)
+
+
+def test_match_text_exact_matches_whole_line():
+    assert srv._match_text("foo\nbar\nfoo", "foo", "exact") == (True, 2)
+    assert srv._match_text("foobar", "foo", "exact") == (False, 0)
+
+
+def test_match_text_regex():
+    assert srv._match_text("err 2026 ok", r"\d{4}", "regex") == (True, 1)
+
+
+def test_match_text_bad_regex_is_safe():
+    assert srv._match_text("anything", "(", "regex") == (False, 0)
+
+
+def test_match_text_empty_needle():
+    assert srv._match_text("anything", "", "contains") == (False, 0)
+
+
+def test_brief_result_summarizes():
+    assert srv._brief_result("wait_for_text", {"found": True}) == "found=True"
+    assert srv._brief_result("x", {"error": "ocr_failed"}) == "ERROR ocr_failed"
+
+
+# --- V2: cursor tracking ---------------------------------------------------
+
+def test_cursor_crop_unknown_when_no_position():
+    srv._cursor_pos = None
+    img, meta = srv._do_cursor_crop()
+    assert img is None
+    assert meta["error"] == "cursor_unknown"
+
+
+def test_set_and_bump_cursor():
+    srv._set_cursor(100, 200)
+    assert srv._cursor_pos == (100, 200)
+    srv._bump_cursor(5, -10)
+    assert srv._cursor_pos == (105, 190)
+    srv._cursor_pos = None  # reset shared state
+
+
+# --- V2: runtime config ----------------------------------------------------
+
+def _fresh_config(tmp_path, monkeypatch=None):
+    path = os.path.join(str(tmp_path), "rt.json")
+    os.environ["SHKVM_RUNTIME_CONFIG"] = path
+    # clear any RT env overrides that might leak in
+    for k in list(os.environ):
+        if k.startswith("SHKVM_RT_"):
+            del os.environ[k]
+    return RuntimeConfig()
+
+
+def test_runtime_config_defaults(tmp_path):
+    cfg = _fresh_config(tmp_path)
+    assert cfg.get("default_wsl_distro") == "Ubuntu-24.04"
+    assert cfg.as_dict() == DEFAULTS
+    assert cfg.file_loaded is False
+
+
+def test_runtime_config_update_valid(tmp_path):
+    cfg = _fresh_config(tmp_path)
+    changed = cfg.update({"wait_poll_ms": 250})
+    assert changed == {"wait_poll_ms": 250}
+    assert cfg.get("wait_poll_ms") == 250
+    assert "wait_poll_ms" in cfg.runtime_keys
+
+
+def test_runtime_config_update_invalid_key(tmp_path):
+    cfg = _fresh_config(tmp_path)
+    try:
+        cfg.update({"nope": 1})
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+    assert "nope" not in cfg.as_dict()
+
+
+def test_runtime_config_update_out_of_range(tmp_path):
+    cfg = _fresh_config(tmp_path)
+    try:
+        cfg.update({"screen_change_threshold": 5})  # max 1.0
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+
+
+def test_runtime_config_hardware_timing_seconds(tmp_path):
+    cfg = _fresh_config(tmp_path)
+    cfg.update({"click_hold_ms": 80, "type_inter_key_ms": 20})
+    hw = cfg.hardware_timing_seconds()
+    assert hw["click_hold"] == 0.08
+    assert hw["char_delay"] == 0.02
+    assert set(hw) == {"char_delay", "type_key_hold", "key_hold", "combo_mod",
+                       "type_shift", "click_hold", "click_after"}
+
+
+def test_runtime_config_reset(tmp_path):
+    cfg = _fresh_config(tmp_path)
+    cfg.update({"wait_poll_ms": 999})
+    cfg.reset()
+    assert cfg.get("wait_poll_ms") == DEFAULTS["wait_poll_ms"]
+    assert cfg.runtime_keys == set()
+
+
+def test_runtime_config_persist_and_reload(tmp_path):
+    cfg = _fresh_config(tmp_path)
+    cfg.update({"cursor_crop_radius": 222})
+    saved = cfg.save()
+    assert os.path.exists(saved)
+    cfg2 = RuntimeConfig()  # same env path
+    assert cfg2.get("cursor_crop_radius") == 222
+    assert cfg2.file_loaded is True
+
+
+def test_runtime_config_env_override(tmp_path):
+    _fresh_config(tmp_path)  # sets path, clears RT env
+    os.environ["SHKVM_RT_WAIT_POLL_MS"] = "321"
+    try:
+        cfg = RuntimeConfig()
+        assert cfg.get("wait_poll_ms") == 321
+        assert "wait_poll_ms" in cfg.env_keys
+    finally:
+        del os.environ["SHKVM_RT_WAIT_POLL_MS"]

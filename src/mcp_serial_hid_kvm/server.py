@@ -11,17 +11,20 @@ import io
 import json
 import logging
 import os
+import re
+import time
 from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import ImageContent, TextContent, Tool
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image, ImageChops, ImageDraw, ImageStat
 from serial_hid_kvm.client import KvmClient, KvmClientError
 from serial_hid_kvm.hid_keycodes import validate_chars
 
 from .config import config
 from .ocr import TerminalOCR
+from .runtime_config import RuntimeConfig
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Global instances
 _client: KvmClient | None = None
 _ocr: TerminalOCR | None = None
+_runtime: RuntimeConfig | None = None
 
 # In-memory screen baseline for screen_changed (set by set_screen_baseline).
 # Holds {"image": PIL.Image (grayscale), "width", "height", "timestamp", "region"}.
@@ -37,8 +41,25 @@ _baseline: dict | None = None
 # Cached target screen size (for mapping OCR pixels -> click coordinates).
 _screen_size: tuple[int, int] | None = None
 
-# Hard ceiling on any wait/timeout exposed by the wrapper command tools.
-MAX_WAIT_SECONDS = 60.0
+# Best-effort last-known target cursor position (x, y) in screen pixels.
+# This stack cannot query the real OS cursor; we track coordinates we issued.
+_cursor_pos: tuple[int, int] | None = None
+
+# Best-effort hint of the last shell open_shell focused ("powershell"/"wsl").
+_focused_shell_hint: str | None = None
+
+
+def get_config() -> RuntimeConfig:
+    global _runtime
+    if _runtime is None:
+        _runtime = RuntimeConfig()
+        logger.info(f"Runtime config loaded from {_runtime.config_path}")
+    return _runtime
+
+
+def _hard_max_wait() -> float:
+    """Absolute ceiling for any wrapper loop/wait, from config max_wait_seconds."""
+    return float(get_config().get("max_wait_seconds"))
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +176,22 @@ def get_client() -> KvmClient:
         _client = KvmClient(config.kvm_host, config.kvm_port)
         _client.connect()
         logger.info("Connected to KVM server")
+        # Push effective HID timing so the original + wrapper tools honor config.
+        _apply_hardware_timing(_client)
     return _client
+
+
+def _apply_hardware_timing(client: KvmClient) -> dict | None:
+    """Send config-derived HID timing (seconds) to the KVM server.
+
+    Best-effort: older servers without set_timing simply return an error which
+    we swallow. Returns the effective timing dict on success, else None.
+    """
+    try:
+        return client.set_timing(get_config().hardware_timing_seconds())
+    except KvmClientError as e:
+        logger.warning(f"set_timing not applied (server may be older): {e}")
+        return None
 
 
 def get_ocr() -> TerminalOCR:
@@ -204,6 +240,19 @@ def _get_screen_size() -> tuple[int, int]:
         except Exception:
             _screen_size = (1920, 1080)
     return _screen_size
+
+
+def _set_cursor(x: int, y: int) -> None:
+    """Record a best-effort absolute target cursor position."""
+    global _cursor_pos
+    _cursor_pos = (int(x), int(y))
+
+
+def _bump_cursor(dx: int, dy: int) -> None:
+    """Update the best-effort cursor by a relative offset, if known."""
+    global _cursor_pos
+    if _cursor_pos is not None:
+        _cursor_pos = (_cursor_pos[0] + int(dx), _cursor_pos[1] + int(dy))
 
 
 def _do_health(client: KvmClient) -> dict:
@@ -277,7 +326,7 @@ async def _run_target_command(
     client.type_text(command, raw=True)
     await asyncio.sleep(0.1)
     client.send_key("enter")
-    await asyncio.sleep(max(0.0, min(wait_seconds, MAX_WAIT_SECONDS)))
+    await asyncio.sleep(max(0.0, min(wait_seconds, _hard_max_wait())))
     image = _capture_image()
     text = get_ocr().extract_text(image)
     if _ocr_failed(text):
@@ -285,6 +334,419 @@ async def _run_target_command(
         return False, err["detail"], False
     output, _line_count, truncated = _compact_text(text, max_lines, max_chars, tail=True)
     return True, output, truncated
+
+
+# ---------------------------------------------------------------------------
+# V2 wrapper helpers
+# ---------------------------------------------------------------------------
+
+def _match_text(haystack: str, needle: str, mode: str) -> tuple[bool, int]:
+    """Return (found, count) for needle in haystack using contains/exact/regex."""
+    if not needle:
+        return (False, 0)
+    if mode == "regex":
+        try:
+            matches = re.findall(needle, haystack)
+        except re.error:
+            return (False, 0)
+        return (len(matches) > 0, len(matches))
+    if mode == "exact":
+        lines = [line.strip() for line in haystack.splitlines()]
+        count = sum(1 for line in lines if line == needle)
+        return (count > 0, count)
+    # contains (case-insensitive)
+    count = haystack.lower().count(needle.lower())
+    return (count > 0, count)
+
+
+def _ocr_region_text(region) -> str:
+    """Capture, optionally crop to region, and OCR to text."""
+    return get_ocr().extract_text(_crop_region(_capture_image(), region))
+
+
+def _do_set_baseline(region=None) -> dict:
+    """Capture and store the in-memory baseline. Returns compact metadata."""
+    global _baseline
+    cropped = _crop_region(_capture_image(), region)
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    _baseline = {
+        "image": cropped.convert("L"),
+        "width": cropped.width,
+        "height": cropped.height,
+        "timestamp": ts,
+        "region": region,
+    }
+    return {"ok": True, "width": cropped.width, "height": cropped.height,
+            "timestamp": ts}
+
+
+def _do_screen_changed(threshold: float, region=None,
+                       auto_baseline: bool = False) -> dict:
+    """One-shot baseline diff. Mirrors the screen_changed tool."""
+    global _baseline
+    current = _crop_region(_capture_image(), region)
+    if _baseline is None:
+        if auto_baseline:
+            _do_set_baseline(region)
+            return {"changed": False, "score": 0.0, "threshold": threshold,
+                    "baseline_created": True}
+        return {"ok": False, "error": "no_baseline",
+                "detail": "Call set_screen_baseline first or pass auto_baseline=true."}
+    score = _diff_score(_baseline["image"], current)
+    return {"changed": score > threshold, "score": round(score, 4),
+            "threshold": threshold}
+
+
+def _do_get_terminal_output(*, region=None, max_lines=None, max_chars=None,
+                            tail: bool = True) -> dict:
+    cfg = get_config()
+    max_lines = int(max_lines if max_lines is not None else cfg.get("terminal_max_lines"))
+    max_chars = int(max_chars if max_chars is not None else cfg.get("terminal_max_chars"))
+    text = _ocr_region_text(region)
+    if _ocr_failed(text):
+        return _compact_ocr_error(text)
+    output, line_count, truncated = _compact_text(text, max_lines, max_chars, tail=tail)
+    return {"ok": True, "output": output, "line_count": line_count,
+            "truncated": truncated, "region": region}
+
+
+async def _do_wait_for_text(client, *, text, match="contains", present=True,
+                            timeout_seconds=None, poll_ms=None, region=None,
+                            min_confidence=0.0, max_chars=1000) -> dict:
+    cfg = get_config()
+    timeout = min(float(timeout_seconds if timeout_seconds is not None
+                        else cfg.get("wait_timeout_seconds")), _hard_max_wait())
+    poll = (poll_ms if poll_ms is not None else cfg.get("wait_poll_ms")) / 1000.0
+    start = time.monotonic()
+    attempts = 0
+    haystack = ""
+    found = False
+    count = 0
+    while True:
+        attempts += 1
+        if min_confidence and min_confidence > 0:
+            els = get_ocr().extract_elements(
+                _crop_region(_capture_image(), region), min_confidence=min_confidence)
+            haystack = "\n".join(e["text"] for e in els)
+        else:
+            haystack = _ocr_region_text(region)
+        found, count = _match_text(haystack, text, match)
+        satisfied = found if present else (not found)
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        if satisfied:
+            excerpt, _lc, _tr = _compact_text(haystack, 0, max_chars, tail=True)
+            return {"ok": True, "found": found, "elapsed_ms": elapsed_ms,
+                    "attempts": attempts, "match_count": count,
+                    "text_excerpt": excerpt}
+        if time.monotonic() - start >= timeout:
+            excerpt, _lc, _tr = _compact_text(haystack, 0, max_chars, tail=True)
+            return {"ok": False, "found": found, "elapsed_ms": elapsed_ms,
+                    "attempts": attempts, "match_count": count,
+                    "text_excerpt": excerpt, "timed_out": True}
+        await asyncio.sleep(poll)
+
+
+async def _do_wait_for_screen_change(client, *, threshold=None, timeout_seconds=None,
+                                     poll_ms=None, region=None, auto_baseline=True,
+                                     update_baseline_on_change=False) -> dict:
+    global _baseline
+    cfg = get_config()
+    threshold = float(threshold if threshold is not None
+                      else cfg.get("screen_change_threshold"))
+    timeout = min(float(timeout_seconds if timeout_seconds is not None
+                        else cfg.get("wait_timeout_seconds")), _hard_max_wait())
+    poll = (poll_ms if poll_ms is not None else cfg.get("wait_poll_ms")) / 1000.0
+    if _baseline is None:
+        if auto_baseline:
+            _do_set_baseline(region)
+        else:
+            return {"ok": False, "error": "no_baseline",
+                    "detail": "Call set_screen_baseline first or pass auto_baseline=true."}
+    start = time.monotonic()
+    attempts = 0
+    score = 0.0
+    while True:
+        attempts += 1
+        current = _crop_region(_capture_image(), region)
+        score = _diff_score(_baseline["image"], current)
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        if score > threshold:
+            if update_baseline_on_change:
+                _baseline["image"] = current.convert("L")
+            return {"changed": True, "score": round(score, 4),
+                    "threshold": threshold, "elapsed_ms": elapsed_ms,
+                    "attempts": attempts}
+        if time.monotonic() - start >= timeout:
+            return {"changed": False, "score": round(score, 4),
+                    "threshold": threshold, "elapsed_ms": elapsed_ms,
+                    "attempts": attempts, "timed_out": True}
+        await asyncio.sleep(poll)
+
+
+async def _do_open_shell(client, *, shell="powershell", distro=None, method="win_r",
+                         wait_seconds=None, verify=True) -> dict:
+    global _focused_shell_hint
+    cfg = get_config()
+    distro = distro or cfg.get("default_wsl_distro")
+    wait_seconds = min(float(wait_seconds if wait_seconds is not None
+                             else cfg.get("open_shell_wait_seconds")), _hard_max_wait())
+    if method == "win_r":
+        client.send_key("r", ["win"])
+        await asyncio.sleep(0.6)
+        client.type_text("powershell", raw=True)
+        await asyncio.sleep(0.2)
+        client.send_key("enter")
+        detail = "Win+R -> powershell"
+    else:  # type_command
+        client.type_text("powershell", raw=True)
+        await asyncio.sleep(0.1)
+        client.send_key("enter")
+        detail = "typed 'powershell' into current focus"
+    await asyncio.sleep(wait_seconds)
+
+    if shell == "wsl":
+        client.type_text(f"wsl.exe -d {distro}", raw=True)
+        await asyncio.sleep(0.1)
+        client.send_key("enter")
+        detail += f"; wsl.exe -d {distro}"
+        await asyncio.sleep(wait_seconds)
+
+    _focused_shell_hint = shell
+    verified = False
+    if verify:
+        text = _ocr_region_text(None)
+        if not _ocr_failed(text):
+            low = text.lower()
+            if shell == "powershell":
+                verified = any(tok in low for tok in ("ps ", "ps>", "powershell")) or (">" in text)
+            else:
+                verified = ("$" in text) or ("@" in text) or (distro.split("-")[0].lower() in low)
+    return {"ok": True, "shell": shell,
+            "distro": distro if shell == "wsl" else None,
+            "method": method, "verified": verified, "detail": detail}
+
+
+def _do_configure(client, *, values=None, reset=False, persist=False) -> dict:
+    cfg = get_config()
+    if reset:
+        cfg.reset()
+    changed: dict = {}
+    if values:
+        try:
+            changed = cfg.update(values)
+        except ValueError as e:
+            return {"ok": False, "error": "invalid_config", "detail": str(e)}
+    _apply_hardware_timing(client)
+    persisted = False
+    path = cfg.config_path
+    if persist:
+        try:
+            path = cfg.save()
+            persisted = True
+        except OSError as e:
+            return {"ok": False, "error": "persist_failed", "detail": str(e),
+                    "changed": changed}
+    try:
+        timing = client.get_timing()
+    except KvmClientError:
+        timing = cfg.hardware_timing_seconds()
+    return {"ok": True, "changed": changed, "config_path": path,
+            "persisted": persisted, "timing": timing}
+
+
+def _do_get_timing(client, include_source: bool = True) -> dict:
+    cfg = get_config()
+    result: dict = {
+        "timing": cfg.as_dict(),
+        "config_path": cfg.config_path,
+        "loaded_at": cfg.loaded_at,
+        "updated_at": cfg.updated_at,
+    }
+    if include_source:
+        result["source"] = cfg.source()
+    if _screen_size is not None:
+        result["screen_size"] = {"width": _screen_size[0], "height": _screen_size[1]}
+    try:
+        result["hardware_timing"] = client.get_timing()
+    except KvmClientError:
+        pass
+    return result
+
+
+def _do_cursor_crop(*, x=None, y=None, radius=None, draw_crosshair=True,
+                    quality=85) -> tuple[bytes | None, dict]:
+    cfg = get_config()
+    radius = int(radius if radius is not None else cfg.get("cursor_crop_radius"))
+    if x is None or y is None:
+        if _cursor_pos is None:
+            return None, {"ok": False, "error": "cursor_unknown",
+                          "detail": "No x/y given and no tracked cursor position."}
+        cx, cy = _cursor_pos
+        source = "tracked_cursor"
+    else:
+        cx, cy = int(x), int(y)
+        _set_cursor(cx, cy)
+        source = "explicit"
+    image = _capture_image()
+    iw, ih = image.size
+    left = max(0, cx - radius)
+    top = max(0, cy - radius)
+    right = min(iw, cx + radius)
+    bottom = min(ih, cy + radius)
+    if right <= left or bottom <= top:
+        return None, {"ok": False, "error": "out_of_bounds",
+                      "detail": f"center ({cx},{cy}) outside frame {iw}x{ih}."}
+    crop = image.crop((left, top, right, bottom)).convert("RGB")
+    if draw_crosshair:
+        d = ImageDraw.Draw(crop)
+        ccx, ccy = cx - left, cy - top
+        d.line([(ccx - 10, ccy), (ccx + 10, ccy)], fill=(255, 0, 0), width=2)
+        d.line([(ccx, ccy - 10), (ccx, ccy + 10)], fill=(255, 0, 0), width=2)
+    buf = io.BytesIO()
+    crop.save(buf, format="JPEG", quality=max(1, min(100, int(quality))))
+    meta = {"ok": True, "center": {"x": cx, "y": cy}, "radius": radius,
+            "box": {"left": left, "top": top, "right": right, "bottom": bottom},
+            "source": source}
+    return buf.getvalue(), meta
+
+
+ALLOWED_TASK_ACTIONS = {
+    "open_shell", "run_powershell_and_read", "run_wsl_and_read", "wait_for_text",
+    "wait_for_screen_change", "get_terminal_output", "screen_changed",
+    "set_screen_baseline", "send_key", "type_text",
+}
+
+
+async def _dispatch_task_action(client, action: str, args: dict) -> dict:
+    """Run a single allowed task step and return a compact result dict."""
+    cfg = get_config()
+    if action == "open_shell":
+        return await _do_open_shell(
+            client, shell=args.get("shell", "powershell"), distro=args.get("distro"),
+            method=args.get("method", "win_r"), wait_seconds=args.get("wait_seconds"),
+            verify=args.get("verify", False))
+    if action in ("run_powershell_and_read", "run_wsl_and_read"):
+        wait = min(float(args.get("wait_seconds", cfg.get("terminal_wait_seconds"))),
+                   _hard_max_wait())
+        max_lines = int(args.get("max_lines", cfg.get("terminal_max_lines")))
+        max_chars = int(args.get("max_chars", cfg.get("terminal_max_chars")))
+        if action == "run_wsl_and_read":
+            distro = args.get("distro") or cfg.get("default_wsl_distro")
+            line = _build_wsl_command(args["command"], distro)
+            ok, out, tr = await _run_target_command(client, line, wait, max_lines, max_chars)
+            base = {"shell": "wsl", "distro": distro}
+        else:
+            ok, out, tr = await _run_target_command(
+                client, args["command"], wait, max_lines, max_chars)
+            base = {"shell": "powershell"}
+        if not ok:
+            return {"ok": False, "error": "ocr_failed", "detail": out, **base}
+        return {"ok": True, "output": out, "truncated": tr, **base}
+    if action == "wait_for_text":
+        return await _do_wait_for_text(
+            client, text=args["text"], match=args.get("match", "contains"),
+            present=args.get("present", True), timeout_seconds=args.get("timeout_seconds"),
+            poll_ms=args.get("poll_ms"), region=args.get("region"),
+            min_confidence=float(args.get("min_confidence", 0.0)),
+            max_chars=int(args.get("max_chars", 1000)))
+    if action == "wait_for_screen_change":
+        return await _do_wait_for_screen_change(
+            client, threshold=args.get("threshold"),
+            timeout_seconds=args.get("timeout_seconds"), poll_ms=args.get("poll_ms"),
+            region=args.get("region"), auto_baseline=args.get("auto_baseline", True),
+            update_baseline_on_change=args.get("update_baseline_on_change", False))
+    if action == "get_terminal_output":
+        return _do_get_terminal_output(
+            region=args.get("region"), max_lines=args.get("max_lines"),
+            max_chars=args.get("max_chars"), tail=args.get("tail", True))
+    if action == "screen_changed":
+        return _do_screen_changed(
+            float(args.get("threshold", cfg.get("screen_change_threshold"))),
+            args.get("region"), args.get("auto_baseline", False))
+    if action == "set_screen_baseline":
+        return _do_set_baseline(args.get("region"))
+    if action == "send_key":
+        client.send_key(args["key"], args.get("modifiers", []))
+        return {"ok": True, "sent": args["key"]}
+    if action == "type_text":
+        validate_chars(args["text"])
+        client.type_text(args["text"], args.get("char_delay_ms"), raw=args.get("raw", False))
+        return {"ok": True, "typed": len(args["text"])}
+    return {"ok": False, "error": "unknown_action", "action": action}
+
+
+def _brief_result(action: str, result: dict) -> str:
+    """One-line summary of a step result for the task report."""
+    if not isinstance(result, dict):
+        return "done"
+    if result.get("error"):
+        return f"ERROR {result['error']}"
+    for key in ("found", "changed", "verified", "output", "typed", "sent", "ok"):
+        if key in result:
+            val = result[key]
+            if key == "output" and isinstance(val, str):
+                val = val.replace("\n", " ")
+                if len(val) > 80:
+                    val = val[:80] + "..."
+            return f"{key}={val}"
+    return "ok"
+
+
+async def _do_run_task_and_report(client, *, task="", steps, max_steps=10,
+                                  timeout_seconds=None, stop_on_error=True,
+                                  max_report_chars=2000) -> dict:
+    cfg = get_config()
+    budget = min(float(timeout_seconds if timeout_seconds is not None
+                       else cfg.get("max_wait_seconds")), _hard_max_wait())
+    start = time.monotonic()
+    steps_run = 0
+    failed_step: int | None = None
+    summary_parts: list[str] = []
+    final_output = ""
+    limit = min(int(max_steps), len(steps))
+    for idx in range(limit):
+        if time.monotonic() - start >= budget:
+            summary_parts.append(f"[{idx}] aborted: time budget exceeded")
+            failed_step = idx
+            break
+        step = steps[idx]
+        if not isinstance(step, dict) or "action" not in step:
+            failed_step = idx
+            summary_parts.append(f"[{idx}] invalid step (no action)")
+            if stop_on_error:
+                break
+            continue
+        action = step["action"]
+        if action not in ALLOWED_TASK_ACTIONS:
+            failed_step = idx
+            summary_parts.append(f"[{idx}] {action}: not allowed")
+            if stop_on_error:
+                break
+            continue
+        args = {k: v for k, v in step.items() if k != "action"}
+        try:
+            result = await _dispatch_task_action(client, action, args)
+        except Exception as e:
+            failed_step = idx
+            summary_parts.append(f"[{idx}] {action}: error {e}")
+            if stop_on_error:
+                break
+            continue
+        steps_run += 1
+        if isinstance(result, dict) and result.get("output"):
+            final_output = result["output"]
+        summary_parts.append(f"[{idx}] {action}: {_brief_result(action, result)}")
+        if isinstance(result, dict) and result.get("error"):
+            failed_step = idx
+            if stop_on_error:
+                break
+    summary = "\n".join(summary_parts)
+    if len(summary) > max_report_chars:
+        summary = summary[:max_report_chars] + "..."
+    fo_excerpt, _lc, _tr = _compact_text(final_output, 0, 600, tail=True)
+    return {"ok": failed_step is None, "task": task, "steps_run": steps_run,
+            "failed_step": failed_step, "summary": summary,
+            "final_output_excerpt": fo_excerpt}
 
 
 # Create MCP server
@@ -721,15 +1183,15 @@ async def list_tools() -> list[Tool]:
                     },
                     "wait_seconds": {
                         "type": "number",
-                        "description": "Seconds to wait for output before OCR (default 2, max 60).",
+                        "description": "Seconds to wait before OCR (default from config terminal_wait_seconds; capped by max_wait_seconds).",
                     },
                     "max_lines": {
                         "type": "integer",
-                        "description": "Maximum output lines to return (default 30).",
+                        "description": "Maximum output lines to return (default from config terminal_max_lines).",
                     },
                     "max_chars": {
                         "type": "integer",
-                        "description": "Maximum output characters to return (default 3000).",
+                        "description": "Maximum output characters to return (default from config terminal_max_chars).",
                     },
                 },
                 "required": ["command"],
@@ -747,22 +1209,253 @@ async def list_tools() -> list[Tool]:
                     },
                     "distro": {
                         "type": "string",
-                        "description": "WSL distro name (default Ubuntu-24.04).",
+                        "description": "WSL distro name (default from config default_wsl_distro).",
                     },
                     "wait_seconds": {
                         "type": "number",
-                        "description": "Seconds to wait for output before OCR (default 2, max 60).",
+                        "description": "Seconds to wait before OCR (default from config terminal_wait_seconds; capped by max_wait_seconds).",
                     },
                     "max_lines": {
                         "type": "integer",
-                        "description": "Maximum output lines to return (default 30).",
+                        "description": "Maximum output lines to return (default from config terminal_max_lines).",
                     },
                     "max_chars": {
                         "type": "integer",
-                        "description": "Maximum output characters to return (default 3000).",
+                        "description": "Maximum output characters to return (default from config terminal_max_chars).",
                     },
                 },
                 "required": ["command"],
+            },
+        ),
+        # -------------------------------------------------------------------
+        # V2 wrapper tools: progressive verification, runtime config, shell
+        # orchestration. All compact JSON except cursor_crop (image-oriented).
+        # -------------------------------------------------------------------
+        Tool(
+            name="open_shell",
+            description="Focus/open a TARGET shell (PowerShell or WSL) via KVM HID so command tools do not depend on current focus. Never runs host commands.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "shell": {
+                        "type": "string",
+                        "enum": ["powershell", "wsl"],
+                        "description": "Which shell to open (default powershell).",
+                    },
+                    "distro": {
+                        "type": "string",
+                        "description": "WSL distro for shell=wsl (default from config default_wsl_distro).",
+                    },
+                    "method": {
+                        "type": "string",
+                        "enum": ["win_r", "type_command"],
+                        "description": "win_r: Win+R run dialog. type_command: type launch command into current focus (default win_r).",
+                    },
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": "Seconds to wait for the shell to appear (default from config open_shell_wait_seconds).",
+                    },
+                    "verify": {
+                        "type": "boolean",
+                        "description": "If true, OCR after opening to look for a prompt (default true).",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="wait_for_text",
+            description="Poll-OCR locally until text appears (or disappears). Avoids repeated model round-trips. Returns compact JSON, no image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Text to wait for."},
+                    "match": {
+                        "type": "string",
+                        "enum": ["contains", "exact", "regex"],
+                        "description": "Match mode (default contains).",
+                    },
+                    "present": {
+                        "type": "boolean",
+                        "description": "Wait until present (true, default) or absent (false).",
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": "Max seconds to poll (default from config wait_timeout_seconds; capped by max_wait_seconds).",
+                    },
+                    "poll_ms": {
+                        "type": "integer",
+                        "description": "Delay between polls in ms (default from config wait_poll_ms).",
+                    },
+                    "region": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional [x,y,w,h] region to OCR.",
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Minimum OCR confidence 0..1 when using element matching (default 0.0).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Max chars in returned text_excerpt (default 1000).",
+                    },
+                },
+                "required": ["text"],
+            },
+        ),
+        Tool(
+            name="wait_for_screen_change",
+            description="Poll a local image diff against the set_screen_baseline until the screen changes (or timeout). Returns compact JSON, no image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "threshold": {
+                        "type": "number",
+                        "description": "Change threshold 0..1 (default from config screen_change_threshold).",
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": "Max seconds to poll (default from config wait_timeout_seconds; capped by max_wait_seconds).",
+                    },
+                    "poll_ms": {
+                        "type": "integer",
+                        "description": "Delay between polls in ms (default from config wait_poll_ms).",
+                    },
+                    "region": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional [x,y,w,h] region to compare.",
+                    },
+                    "auto_baseline": {
+                        "type": "boolean",
+                        "description": "Seed a baseline if none exists (default true).",
+                    },
+                    "update_baseline_on_change": {
+                        "type": "boolean",
+                        "description": "Replace the baseline with the changed frame when detected (default false).",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="cursor_crop",
+            description="Return a small image crop around a coordinate (or the best-effort tracked cursor). This is the only V2 tool that returns an image. Use after detect_text_elements/click_text when a small visual check is needed.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "description": "Center X (screen px). Omit to use tracked cursor."},
+                    "y": {"type": "integer", "description": "Center Y (screen px). Omit to use tracked cursor."},
+                    "radius": {
+                        "type": "integer",
+                        "description": "Half-size of the crop box in px (default from config cursor_crop_radius).",
+                    },
+                    "draw_crosshair": {
+                        "type": "boolean",
+                        "description": "Draw a crosshair at the center (default true).",
+                    },
+                    "quality": {
+                        "type": "integer",
+                        "description": "JPEG quality 1-100 (default 85).",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_terminal_output",
+            description="OCR only a region (default: full-screen tail) and return the latest lines. Compact JSON, no image.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "region": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional [x,y,w,h] region. Default is full screen (tail).",
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Maximum lines (default from config terminal_max_lines).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Maximum characters (default from config terminal_max_chars).",
+                    },
+                    "tail": {
+                        "type": "boolean",
+                        "description": "Keep the last lines/chars (default true).",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="run_task_and_report",
+            description="Run a small bounded sequence of allowed wrapper steps locally and return only a summary (token-saving). Not for arbitrary autonomy; no host commands; text-only report.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "Short label for the task."},
+                    "steps": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Ordered steps. Each: {action, ...action args}. Allowed actions: open_shell, run_powershell_and_read, run_wsl_and_read, wait_for_text, wait_for_screen_change, get_terminal_output, screen_changed, set_screen_baseline, send_key, type_text.",
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "description": "Maximum steps to run (default 10).",
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": "Overall budget in seconds (default from config max_wait_seconds; capped by it).",
+                    },
+                    "stop_on_error": {
+                        "type": "boolean",
+                        "description": "Stop at the first failing step (default true).",
+                    },
+                    "max_report_chars": {
+                        "type": "integer",
+                        "description": "Maximum characters in the summary (default 2000).",
+                    },
+                },
+                "required": ["steps"],
+            },
+        ),
+        Tool(
+            name="configure",
+            description="Tune runtime timing/operational config without restarting. Applies HID timing to the KVM server live. Returns the effective timing.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "values": {
+                        "type": "object",
+                        "description": "Map of config keys to new values (see get_timing for keys).",
+                    },
+                    "reset": {
+                        "type": "boolean",
+                        "description": "Reset in-memory config to defaults before applying values (default false).",
+                    },
+                    "persist": {
+                        "type": "boolean",
+                        "description": "Write the effective config to the runtime config file (default false).",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_timing",
+            description="Return the in-memory effective runtime config (timing + operational defaults) and its source. Does not capture the screen.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "include_source": {
+                        "type": "boolean",
+                        "description": "Include load-source breakdown (default true).",
+                    },
+                },
+                "required": [],
             },
         ),
     ]
@@ -801,8 +1494,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             relative = arguments.get("relative", False)
             client.mouse_move(x, y, relative)
             if relative:
+                _bump_cursor(x, y)
                 return [TextContent(type="text", text=f"Moved mouse by ({x}, {y})")]
             else:
+                _set_cursor(x, y)
                 return [TextContent(type="text", text=f"Moved mouse to ({x}, {y})")]
 
         elif name == "mouse_click":
@@ -810,6 +1505,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             x = arguments.get("x")
             y = arguments.get("y")
             client.mouse_click(button, x, y)
+            if x is not None and y is not None:
+                _set_cursor(x, y)
             pos_str = f" at ({x}, {y})" if x is not None and y is not None else ""
             return [TextContent(type="text", text=f"Clicked {button}{pos_str}")]
 
@@ -824,6 +1521,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             client.mouse_move(end_x, end_y)
             await asyncio.sleep(0.05)
             client.mouse_up(button, end_x, end_y)
+            _set_cursor(end_x, end_y)
             return [TextContent(
                 type="text",
                 text=f"Dragged {button} from ({start_x}, {start_y}) to ({end_x}, {end_y})",
@@ -941,7 +1639,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             }, ensure_ascii=False))]
 
         elif name == "screen_changed":
-            threshold = float(arguments.get("threshold", 0.02))
+            threshold = float(arguments.get(
+                "threshold", get_config().get("screen_change_threshold")))
             region = arguments.get("region")
             auto_baseline = arguments.get("auto_baseline", False)
             image = _capture_image()
@@ -1048,16 +1747,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                     "x": sx, "y": sy, "match_count": len(matches),
                 }, ensure_ascii=False))]
             client.mouse_click(button, sx, sy)
+            _set_cursor(sx, sy)
             return [TextContent(type="text", text=json.dumps({
                 "clicked": True, "text": el["text"],
                 "x": sx, "y": sy, "match_count": len(matches),
             }, ensure_ascii=False))]
 
         elif name == "run_powershell_and_read":
+            cfg = get_config()
             command = arguments["command"]
-            wait_seconds = min(float(arguments.get("wait_seconds", 2.0)), MAX_WAIT_SECONDS)
-            max_lines = int(arguments.get("max_lines", 30))
-            max_chars = int(arguments.get("max_chars", 3000))
+            wait_seconds = min(
+                float(arguments.get("wait_seconds", cfg.get("terminal_wait_seconds"))),
+                _hard_max_wait())
+            max_lines = int(arguments.get("max_lines", cfg.get("terminal_max_lines")))
+            max_chars = int(arguments.get("max_chars", cfg.get("terminal_max_chars")))
             ok, output, truncated = await _run_target_command(
                 client, command, wait_seconds, max_lines, max_chars
             )
@@ -1072,11 +1775,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             }, ensure_ascii=False))]
 
         elif name == "run_wsl_and_read":
+            cfg = get_config()
             command = arguments["command"]
-            distro = arguments.get("distro", "Ubuntu-24.04")
-            wait_seconds = min(float(arguments.get("wait_seconds", 2.0)), MAX_WAIT_SECONDS)
-            max_lines = int(arguments.get("max_lines", 30))
-            max_chars = int(arguments.get("max_chars", 3000))
+            distro = arguments.get("distro") or cfg.get("default_wsl_distro")
+            wait_seconds = min(
+                float(arguments.get("wait_seconds", cfg.get("terminal_wait_seconds"))),
+                _hard_max_wait())
+            max_lines = int(arguments.get("max_lines", cfg.get("terminal_max_lines")))
+            max_chars = int(arguments.get("max_chars", cfg.get("terminal_max_chars")))
             ps_line = _build_wsl_command(command, distro)
             ok, output, truncated = await _run_target_command(
                 client, ps_line, wait_seconds, max_lines, max_chars
@@ -1090,6 +1796,77 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 "ok": True, "shell": "wsl", "distro": distro,
                 "output": output, "truncated": truncated,
             }, ensure_ascii=False))]
+
+        elif name == "open_shell":
+            result = await _do_open_shell(
+                client, shell=arguments.get("shell", "powershell"),
+                distro=arguments.get("distro"), method=arguments.get("method", "win_r"),
+                wait_seconds=arguments.get("wait_seconds"),
+                verify=arguments.get("verify", True))
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "wait_for_text":
+            result = await _do_wait_for_text(
+                client, text=arguments["text"], match=arguments.get("match", "contains"),
+                present=arguments.get("present", True),
+                timeout_seconds=arguments.get("timeout_seconds"),
+                poll_ms=arguments.get("poll_ms"), region=arguments.get("region"),
+                min_confidence=float(arguments.get("min_confidence", 0.0)),
+                max_chars=int(arguments.get("max_chars", 1000)))
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "wait_for_screen_change":
+            result = await _do_wait_for_screen_change(
+                client, threshold=arguments.get("threshold"),
+                timeout_seconds=arguments.get("timeout_seconds"),
+                poll_ms=arguments.get("poll_ms"), region=arguments.get("region"),
+                auto_baseline=arguments.get("auto_baseline", True),
+                update_baseline_on_change=arguments.get("update_baseline_on_change", False))
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "get_terminal_output":
+            result = _do_get_terminal_output(
+                region=arguments.get("region"), max_lines=arguments.get("max_lines"),
+                max_chars=arguments.get("max_chars"), tail=arguments.get("tail", True))
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "cursor_crop":
+            img_bytes, meta = _do_cursor_crop(
+                x=arguments.get("x"), y=arguments.get("y"),
+                radius=arguments.get("radius"),
+                draw_crosshair=arguments.get("draw_crosshair", True),
+                quality=arguments.get("quality", 85))
+            if img_bytes is None:
+                return [TextContent(type="text", text=json.dumps(meta, ensure_ascii=False))]
+            b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
+            return [
+                TextContent(type="text", text=json.dumps(meta, ensure_ascii=False)),
+                ImageContent(type="image", data=b64, mimeType="image/jpeg"),
+            ]
+
+        elif name == "run_task_and_report":
+            result = await _do_run_task_and_report(
+                client, task=arguments.get("task", ""), steps=arguments.get("steps", []),
+                max_steps=int(arguments.get("max_steps", 10)),
+                timeout_seconds=arguments.get("timeout_seconds"),
+                stop_on_error=arguments.get("stop_on_error", True),
+                max_report_chars=int(arguments.get("max_report_chars", 2000)))
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "configure":
+            args = dict(arguments)
+            reset = bool(args.pop("reset", False))
+            persist = bool(args.pop("persist", False))
+            values = dict(args.pop("values", None) or {})
+            # Accept flat keys for compatibility.
+            for key in list(args.keys()):
+                values[key] = args.pop(key)
+            result = _do_configure(client, values=values, reset=reset, persist=persist)
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "get_timing":
+            result = _do_get_timing(client, include_source=arguments.get("include_source", True))
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
