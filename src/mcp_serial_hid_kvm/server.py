@@ -815,7 +815,8 @@ def _paste_unicode_build_command(text: str) -> tuple[str, str, bytes]:
         "while($b.Length%4){$b+='='};"
         "$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b));"
         "Set-Clipboard -Value $s;"
-        "Write-Output ('PASTE_UNICODE_OK chars='+$s.Length)"
+        "Write-Output ('PASTE_UNICODE_OK chars='+$s.Length);"
+        "exit"
     )
     return command, payload, utf8_bytes
 
