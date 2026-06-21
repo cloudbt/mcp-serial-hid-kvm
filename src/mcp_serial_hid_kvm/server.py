@@ -286,13 +286,20 @@ def _do_health(client: KvmClient) -> dict:
                 errors.append(f"serial: {serial['error']}")
             cap = info.get("capture", {})
             if cap and not cap.get("error"):
-                video_ok = True
                 capture_device = (
                     str(cap.get("device")) if cap.get("device") is not None else None
                 )
                 w, h = cap.get("width"), cap.get("height")
                 if w and h:
                     resolution = f"{w}x{h}"
+                # Config alone is not enough: actually fetch a frame so a stalled
+                # capture (e.g. capture thread not streaming) is reported as a
+                # failure instead of a false-positive video:true.
+                try:
+                    client.capture_frame_jpeg(40)
+                    video_ok = True
+                except Exception as e:
+                    errors.append(f"video: {e}")
             elif cap.get("error"):
                 errors.append(f"video: {cap['error']}")
         except Exception as e:
