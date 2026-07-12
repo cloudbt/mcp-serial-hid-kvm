@@ -386,3 +386,216 @@ def test_paste_unicode_estimate_seconds_basic():
 def test_paste_unicode_estimate_seconds_normal_timing():
     # 1000 chars at 20+20 ms/char = 40.0 s
     assert srv._paste_unicode_estimate_seconds(1000, 20, 20) == 40.0
+
+
+# --- ops tools: save_evidence label sanitizing ------------------------------
+
+def test_sanitize_label_keeps_safe_chars():
+    assert srv._sanitize_label("INC51031_F56-ST22") == "INC51031_F56-ST22"
+
+
+def test_sanitize_label_replaces_unsafe_runs():
+    assert srv._sanitize_label("INC 51031/F56:ST22 ") == "INC_51031_F56_ST22"
+
+
+def test_sanitize_label_empty_inputs():
+    assert srv._sanitize_label(None) == ""
+    assert srv._sanitize_label("///") == ""
+
+
+# --- ops tools: done-marker wrapping ----------------------------------------
+
+def test_new_done_marker_uses_safe_alphabet():
+    for _ in range(20):
+        marker = srv._new_done_marker()
+        assert marker.startswith("KVMDONE_")
+        suffix = marker[len("KVMDONE_"):]
+        assert len(suffix) == 4
+        assert all(c in srv._MARKER_ALPHABET for c in suffix)
+
+
+def test_wrap_command_with_marker_hides_marker_from_echo():
+    marker = "KVMDONE_ACDE"
+    wrapped = srv._wrap_command_with_marker("terraform plan", marker)
+    # The typed line must NOT contain the assembled marker (would false-match
+    # on the command echo), but must produce it when PowerShell evaluates it.
+    assert marker not in wrapped
+    assert wrapped.startswith("terraform plan; ")
+    assert "Write-Output ('KV'+'MDONE_ACDE')" in wrapped
+
+
+# --- ops tools: transfer_unicode_file command building -----------------------
+
+def test_transfer_commands_are_pure_ascii():
+    init_cmd, chunk_cmds, final_cmd, _, _, _ = srv._transfer_build_commands(
+        "日本語の手順書\nライン2", r"C:\Temp\runbook.md")
+    for cmd in [init_cmd, *chunk_cmds, final_cmd]:
+        assert cmd.isascii()
+
+
+def test_transfer_commands_roundtrip():
+    import base64 as b64
+    text = "日本語テスト ABC 123\n改行もOK"
+    _, chunk_cmds, _, sha12, payload_chars, utf8_bytes = \
+        srv._transfer_build_commands(text, r"C:\Temp\t.txt", chunk_chars=100)
+    # Reassemble the payload exactly as the target-side PowerShell would.
+    import re as _re
+    payload = "".join(
+        _re.search(r"-Value '([^']*)' -NoNewline$", c).group(1)
+        for c in chunk_cmds)
+    assert len(payload) == payload_chars
+    padded = payload.replace("-", "+").replace("_", "/")
+    padded += "=" * ((-len(padded)) % 4)
+    decoded = b64.b64decode(padded)
+    assert decoded.decode("utf-8") == text
+    assert len(decoded) == utf8_bytes
+    import hashlib as _hashlib
+    assert _hashlib.sha256(decoded).hexdigest()[:12].upper() == sha12
+
+
+def test_transfer_commands_escape_single_quotes_in_path():
+    _, _, final_cmd, _, _, _ = srv._transfer_build_commands(
+        "x", r"C:\Temp\o'brien.txt")
+    assert r"o''brien.txt" in final_cmd
+
+
+def test_transfer_final_command_hides_xfer_marker():
+    _, _, final_cmd, _, _, _ = srv._transfer_build_commands("x", r"C:\t.txt")
+    assert "XFER_OK" not in final_cmd          # echo-safety (split string)
+    assert "'XF'+'ER_OK '" in final_cmd
+
+
+def test_transfer_chunking_respects_chunk_size():
+    text = "あ" * 500  # 500 CJK chars -> 2000 base64 chars
+    _, chunk_cmds, _, _, payload_chars, _ = srv._transfer_build_commands(
+        text, r"C:\t.txt", chunk_chars=300)
+    assert len(chunk_cmds) == (payload_chars + 299) // 300
+
+
+# --- ops tools: input lock ---------------------------------------------------
+
+def _reset_lock():
+    srv._input_lock = None
+
+
+def test_input_lock_blocks_input_tools_only():
+    _reset_lock()
+    try:
+        srv._do_set_input_lock(locked=True, reason="observing PRD F56")
+        err = srv._check_input_lock("type_text", {})
+        assert err is not None
+        assert err["error"] == "input_locked"
+        assert err["reason"] == "observing PRD F56"
+        # Read-only tools stay available.
+        assert srv._check_input_lock("get_screen_text_compact", {}) is None
+        assert srv._check_input_lock("health", {}) is None
+        assert srv._check_input_lock("save_evidence", {}) is None
+    finally:
+        _reset_lock()
+
+
+def test_input_lock_allows_dry_run_variants():
+    _reset_lock()
+    try:
+        srv._do_set_input_lock(locked=True)
+        assert srv._check_input_lock("click_text", {"dry_run": True}) is None
+        assert srv._check_input_lock("click_text", {}) is not None
+        assert srv._check_input_lock("transfer_unicode_file", {"dry_run": True}) is None
+    finally:
+        _reset_lock()
+
+
+def test_input_unlock_requires_confirm():
+    _reset_lock()
+    try:
+        srv._do_set_input_lock(locked=True)
+        res = srv._do_set_input_lock(locked=False)
+        assert res["ok"] is False and res["error"] == "confirm_required"
+        assert srv._input_lock is not None
+        res = srv._do_set_input_lock(locked=False, confirm="UNLOCK")
+        assert res["ok"] is True and res["locked"] is False
+        assert srv._input_lock is None
+    finally:
+        _reset_lock()
+
+
+def test_input_tools_cover_all_hid_generating_tools():
+    expected = {
+        "type_text", "send_key", "send_key_sequence",
+        "mouse_move", "mouse_click", "mouse_drag", "mouse_scroll",
+        "execute_and_read", "run_powershell_and_read", "run_wsl_and_read",
+        "run_powershell_until_done", "open_shell", "click_text",
+        "run_task_and_report", "paste_unicode_text", "transfer_unicode_file",
+    }
+    assert srv.INPUT_TOOLS == expected
+
+
+# --- ops tools: multi-target config parsing ----------------------------------
+
+def test_parse_targets_default_only():
+    from mcp_serial_hid_kvm.config import parse_targets
+    t = parse_targets(None, "127.0.0.1", 9329)
+    assert t == {"default": {"host": "127.0.0.1", "port": 9329}}
+
+
+def test_parse_targets_string_and_dict_forms():
+    from mcp_serial_hid_kvm.config import parse_targets
+    raw = ('{"aws-pc": "127.0.0.1:9329", '
+           '"sap-pc": {"host": "192.168.1.20", "port": 9331}}')
+    t = parse_targets(raw, "127.0.0.1", 9329)
+    assert t["aws-pc"] == {"host": "127.0.0.1", "port": 9329}
+    assert t["sap-pc"] == {"host": "192.168.1.20", "port": 9331}
+    assert "default" in t
+
+
+def test_parse_targets_ignores_bad_entries_and_bad_json():
+    from mcp_serial_hid_kvm.config import parse_targets
+    t = parse_targets('{"bad": 42, "ok": "h:1"}', "127.0.0.1", 9329)
+    assert "bad" not in t
+    assert t["ok"] == {"host": "h", "port": 1}
+    t2 = parse_targets("not json", "127.0.0.1", 9329)
+    assert list(t2) == ["default"]
+
+
+def test_select_target_unknown_name_lists_known():
+    res = srv._do_select_target(name="nope-such-target")
+    assert res["ok"] is False
+    assert res["error"] == "unknown_target"
+    assert "default" in res["known"]
+
+
+def test_select_target_requires_name_or_hostport():
+    res = srv._do_select_target()
+    assert res["ok"] is False
+    assert res["error"] == "missing_target"
+
+
+# --- hidden tools -------------------------------------------------------------
+
+def test_parse_hidden_tools_default_and_overrides():
+    from mcp_serial_hid_kvm.config import DEFAULT_HIDDEN_TOOLS, parse_hidden_tools
+    assert parse_hidden_tools(None) == set(DEFAULT_HIDDEN_TOOLS)
+    assert parse_hidden_tools("none") == set()
+    assert parse_hidden_tools("") == set()
+    assert parse_hidden_tools("a, b ,c") == {"a", "b", "c"}
+
+
+def test_list_tools_filters_hidden_but_keeps_them_callable():
+    import asyncio
+    from mcp_serial_hid_kvm.config import DEFAULT_HIDDEN_TOOLS, config
+
+    old = config.hidden_tools
+    try:
+        config.hidden_tools = set(DEFAULT_HIDDEN_TOOLS)
+        names = {t.name for t in asyncio.run(srv.list_tools())}
+        assert names.isdisjoint(DEFAULT_HIDDEN_TOOLS)
+        # replacements are exposed
+        assert {"run_powershell_and_read", "get_screen_text_compact",
+                "wait_for_screen_change", "type_text", "send_key"} <= names
+        # hidden tools are still dispatchable (hidden != disabled): the
+        # dispatcher must not answer "Unknown tool" for them.
+        config.hidden_tools = set()
+        all_names = {t.name for t in asyncio.run(srv.list_tools())}
+        assert DEFAULT_HIDDEN_TOOLS <= all_names
+    finally:
+        config.hidden_tools = old

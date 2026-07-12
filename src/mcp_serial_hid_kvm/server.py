@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import time
 from typing import Any
@@ -48,6 +49,15 @@ _cursor_pos: tuple[int, int] | None = None
 
 # Best-effort hint of the last shell open_shell focused ("powershell"/"wsl").
 _focused_shell_hint: str | None = None
+
+# Active KVM target (select_target switches this; get_client uses it).
+_current_target: dict = {"name": "default",
+                         "host": config.kvm_host, "port": config.kvm_port}
+
+# Input interlock (set_input_lock). When set, all HID-generating tools are
+# refused — for observing production screens (e.g. PRD/F56) without any risk
+# of stray keystrokes. In-memory only: an MCP server restart clears it.
+_input_lock: dict | None = None
 
 
 def get_config() -> RuntimeConfig:
@@ -182,9 +192,9 @@ def _build_wsl_command(command: str, distro: str) -> str:
 def get_client() -> KvmClient:
     global _client
     if _client is None:
-        _client = KvmClient(config.kvm_host, config.kvm_port)
+        _client = KvmClient(_current_target["host"], _current_target["port"])
         _client.connect()
-        logger.info("Connected to KVM server")
+        logger.info(f"Connected to KVM server ({_current_target['name']})")
         # Push effective HID timing so the original + wrapper tools honor config.
         _apply_hardware_timing(_client)
     return _client
@@ -321,6 +331,8 @@ def _do_health(client: KvmClient) -> dict:
         "ocr": ocr_ok,
         "capture_device": capture_device,
         "resolution": resolution,
+        "target": _current_target["name"],
+        "input_locked": _input_lock is not None,
         "errors": errors,
     }
 
@@ -961,14 +973,375 @@ async def _do_paste_unicode_text(
     }
 
 
+# ---------------------------------------------------------------------------
+# Input interlock (set_input_lock)
+# ---------------------------------------------------------------------------
+
+# Tools that generate HID input on the target. Everything else (capture, OCR,
+# health, config, target selection) stays available while locked.
+INPUT_TOOLS = {
+    "type_text", "send_key", "send_key_sequence",
+    "mouse_move", "mouse_click", "mouse_drag", "mouse_scroll",
+    "execute_and_read", "run_powershell_and_read", "run_wsl_and_read",
+    "run_powershell_until_done", "open_shell", "click_text",
+    "run_task_and_report", "paste_unicode_text", "transfer_unicode_file",
+}
+
+_UNLOCK_CONFIRM = "UNLOCK"
+
+
+def _check_input_lock(name: str, arguments: dict) -> dict | None:
+    """Return a refusal payload if *name* is an input tool and the lock is set."""
+    if _input_lock is None or name not in INPUT_TOOLS:
+        return None
+    # dry_run variants produce no HID input.
+    if name in ("click_text", "paste_unicode_text", "transfer_unicode_file") \
+            and arguments.get("dry_run"):
+        return None
+    return {
+        "ok": False,
+        "error": "input_locked",
+        "reason": _input_lock.get("reason"),
+        "since": _input_lock.get("since"),
+        "detail": ("Input tools are locked (read-only mode). "
+                   f"Call set_input_lock with locked=false and confirm='{_UNLOCK_CONFIRM}' to release."),
+    }
+
+
+def _do_set_input_lock(*, locked: bool, reason=None, confirm=None) -> dict:
+    global _input_lock
+    if locked:
+        _input_lock = {
+            "reason": reason or "manual lock",
+            "since": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        return {"ok": True, "locked": True, **_input_lock}
+    if _input_lock is not None and confirm != _UNLOCK_CONFIRM:
+        return {"ok": False, "error": "confirm_required",
+                "detail": f"Pass confirm='{_UNLOCK_CONFIRM}' to release the input lock."}
+    _input_lock = None
+    return {"ok": True, "locked": False}
+
+
+# ---------------------------------------------------------------------------
+# Multi-target support (select_target / list_targets)
+# ---------------------------------------------------------------------------
+
+def _do_select_target(*, name=None, host=None, port=None) -> dict:
+    """Switch the active KVM server. Resets per-target caches (baseline etc.)."""
+    global _client, _baseline, _screen_size, _cursor_pos, _focused_shell_hint
+    global _current_target
+    if name:
+        spec = config.targets.get(name)
+        if spec is None:
+            return {"ok": False, "error": "unknown_target",
+                    "known": sorted(config.targets)}
+        host, port = spec["host"], spec["port"]
+    elif not host or not port:
+        return {"ok": False, "error": "missing_target",
+                "detail": "Pass name (see list_targets), or host and port."}
+    else:
+        name = f"{host}:{port}"
+    if _client is not None:
+        try:
+            _client.close()
+        except Exception:
+            pass
+        _client = None
+    # Baselines, screen size and cursor tracking belong to the old target.
+    _baseline = None
+    _screen_size = None
+    _cursor_pos = None
+    _focused_shell_hint = None
+    _current_target = {"name": name, "host": host, "port": int(port)}
+    result = {"ok": True, "target": name, "host": host, "port": int(port)}
+    try:
+        get_client().ping()
+        result["ping"] = True
+    except Exception as e:
+        result["ok"] = False
+        result["ping"] = False
+        result["error"] = "ping_failed"
+        result["detail"] = str(e)
+    return result
+
+
+def _do_list_targets() -> dict:
+    return {
+        "targets": {n: f"{s['host']}:{s['port']}" for n, s in config.targets.items()},
+        "current": dict(_current_target),
+        "connected": _client is not None,
+        "input_locked": _input_lock is not None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# save_evidence
+# ---------------------------------------------------------------------------
+
+def _sanitize_label(label) -> str:
+    """Reduce a label to filesystem-safe [A-Za-z0-9_-]; empty when nothing survives."""
+    if not label:
+        return ""
+    return re.sub(r"[^A-Za-z0-9_\-]+", "_", str(label).strip()).strip("_")
+
+
+def _do_save_evidence(*, label, step=None, region=None, image_format="png",
+                      quality=90) -> dict:
+    base = config.evidence_dir
+    if not base:
+        return {"ok": False, "error": "no_evidence_dir",
+                "detail": "SHKVM_EVIDENCE_DIR is disabled (set to a directory to enable)."}
+    clean_label = _sanitize_label(label)
+    if not clean_label:
+        return {"ok": False, "error": "bad_label",
+                "detail": "label must contain letters/digits (e.g. INC51031_F56_ST22)."}
+    clean_step = _sanitize_label(step)
+    image = _crop_region(_capture_image(), region)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ext = "jpg" if image_format == "jpg" else "png"
+    filename = ts + (f"_{clean_step}" if clean_step else "") + f".{ext}"
+    dirpath = os.path.join(base, clean_label)
+    try:
+        os.makedirs(dirpath, exist_ok=True)
+        path = os.path.join(dirpath, filename)
+        if ext == "jpg":
+            image.convert("RGB").save(path, format="JPEG",
+                                      quality=max(1, min(100, int(quality))))
+        else:
+            image.save(path, format="PNG")
+        size = os.path.getsize(path)
+    except OSError as e:
+        return {"ok": False, "error": "save_failed", "detail": str(e)}
+    return {"ok": True, "path": path, "label": clean_label,
+            "width": image.width, "height": image.height, "bytes": size,
+            "target": _current_target["name"]}
+
+
+# ---------------------------------------------------------------------------
+# run_powershell_until_done (sentinel-based long-running commands)
+# ---------------------------------------------------------------------------
+
+# OCR-robust marker alphabet: no 0/O, 1/I/l, 5/S, 8/B, 2/Z confusions.
+_MARKER_ALPHABET = "ACDEFHJKMNPRTUWXY34679"
+
+
+def _new_done_marker() -> str:
+    rid = "".join(random.choice(_MARKER_ALPHABET) for _ in range(4))
+    return f"KVMDONE_{rid}"
+
+
+def _wrap_command_with_marker(command: str, marker: str) -> str:
+    """Append a marker echo whose *typed* form never contains the marker.
+
+    The command echo on screen shows ``('KV'+'MDONE_XXXX')`` while the actual
+    output line shows the assembled ``KVMDONE_XXXX`` — so an OCR contains-match
+    on the marker only fires when the command has finished.
+    """
+    head, tail = marker[:2], marker[2:]
+    return f"{command}; Write-Output ('{head}'+'{tail}')"
+
+
+async def _do_run_until_done(client, *, command, timeout_seconds=None,
+                             poll_ms=None, max_lines=None, max_chars=None,
+                             lang=None) -> dict:
+    marker = _new_done_marker()
+    wrapped = _wrap_command_with_marker(command, marker)
+    validate_chars(wrapped)
+    _clear_input_line(client)
+    await asyncio.sleep(0.05)
+    client.type_text(wrapped, raw=True)
+    await asyncio.sleep(0.1)
+    client.send_key("enter")
+    wait = await _do_wait_for_text(
+        client, text=marker, match="contains", present=True,
+        timeout_seconds=timeout_seconds, poll_ms=poll_ms, lang=lang)
+    out = _do_get_terminal_output(max_lines=max_lines, max_chars=max_chars,
+                                  tail=True, lang=lang)
+    result: dict = {
+        "ok": bool(wait.get("found")) and bool(out.get("ok")),
+        "done": bool(wait.get("found")),
+        "elapsed_ms": wait.get("elapsed_ms"),
+        "attempts": wait.get("attempts"),
+        "marker": marker,
+        "output": out.get("output"),
+        "truncated": out.get("truncated"),
+    }
+    if wait.get("timed_out"):
+        result["timed_out"] = True
+        result["detail"] = ("Marker not seen before timeout; the command may "
+                            "still be running on the target.")
+    if not out.get("ok"):
+        result["error"] = out.get("error")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# transfer_unicode_file helpers
+# ---------------------------------------------------------------------------
+
+_TRANSFER_TMP_EXPR = "(Join-Path $env:TEMP 'kvm_xfer.b64')"
+_TRANSFER_DEFAULT_CHUNK = 2500
+
+
+def _ps_quote_single(s: str) -> str:
+    """Escape a string for a PowerShell single-quoted literal."""
+    return s.replace("'", "''")
+
+
+def _transfer_build_commands(text: str, target_path: str,
+                             chunk_chars: int = _TRANSFER_DEFAULT_CHUNK):
+    """Build the PowerShell command sequence that writes *text* (UTF-8, no BOM)
+    to *target_path* via chunked Base64URL typed into a temp file.
+
+    Returns ``(init_cmd, chunk_cmds, final_cmd, sha256_12, payload_chars,
+    utf8_bytes)``. All commands are pure ASCII. sha256_12 is the uppercase
+    12-hex-char prefix that the final command echoes for verification.
+    """
+    utf8 = text.encode("utf-8")
+    payload = base64.urlsafe_b64encode(utf8).decode("ascii").rstrip("=")
+    chunk_chars = max(100, int(chunk_chars))
+    chunks = [payload[i:i + chunk_chars] for i in range(0, len(payload), chunk_chars)]
+    dest = _ps_quote_single(target_path)
+    init_cmd = f"Set-Content -LiteralPath {_TRANSFER_TMP_EXPR} -Value '' -NoNewline"
+    chunk_cmds = [
+        f"Add-Content -LiteralPath {_TRANSFER_TMP_EXPR} -Value '{c}' -NoNewline"
+        for c in chunks
+    ]
+    sha256_12 = hashlib.sha256(utf8).hexdigest()[:12].upper()
+    final_cmd = (
+        f"$p={_TRANSFER_TMP_EXPR};"
+        "$b=(Get-Content -LiteralPath $p -Raw);"
+        "$b=$b.Replace('-','+').Replace('_','/');"
+        "while($b.Length%4){$b+='='};"
+        "$y=[Convert]::FromBase64String($b);"
+        f"[IO.File]::WriteAllBytes('{dest}',$y);"
+        "Remove-Item -LiteralPath $p;"
+        f"$h=(Get-FileHash -LiteralPath '{dest}' -Algorithm SHA256).Hash.Substring(0,12);"
+        "Write-Output ('XF'+'ER_OK '+$h+' bytes='+$y.Length)"
+    )
+    return init_cmd, chunk_cmds, final_cmd, sha256_12, len(payload), len(utf8)
+
+
+async def _do_transfer_unicode_file(
+    client: KvmClient,
+    *,
+    text: str,
+    target_path: str,
+    chunk_chars: int = _TRANSFER_DEFAULT_CHUNK,
+    focus_shell: bool = True,
+    wait_seconds: float = 2.0,
+    fast_timing: bool = True,
+    type_key_ms: int = 5,
+    type_inter_key_ms: int = 5,
+    type_shift_ms: int = 0,
+    max_text_chars: int = 8000,
+    verify: bool = True,
+    dry_run: bool = False,
+) -> dict:
+    """Write Unicode text to a file on the target via chunked Base64 typing."""
+    if not text:
+        return {"ok": False, "error": "empty_text"}
+    if len(text) > max_text_chars:
+        return {"ok": False, "error": "text_too_long",
+                "text_chars": len(text), "max_text_chars": max_text_chars}
+    try:
+        validate_chars(target_path)
+    except Exception as e:
+        return {"ok": False, "error": "bad_target_path", "detail": str(e)}
+
+    init_cmd, chunk_cmds, final_cmd, sha256_12, payload_chars, utf8_bytes = \
+        _transfer_build_commands(text, target_path, chunk_chars)
+    all_cmds = [init_cmd, *chunk_cmds, final_cmd]
+    for cmd in all_cmds:
+        validate_chars(cmd)
+
+    cfg = get_config()
+    eff_key_ms = type_key_ms if fast_timing else cfg.get("type_key_ms")
+    eff_inter_ms = type_inter_key_ms if fast_timing else cfg.get("type_inter_key_ms")
+    total_chars = sum(len(c) for c in all_cmds)
+    estimated_s = _paste_unicode_estimate_seconds(total_chars, eff_key_ms, eff_inter_ms)
+
+    meta: dict = {
+        "text_chars": len(text),
+        "utf8_bytes": utf8_bytes,
+        "payload_chars": payload_chars,
+        "chunks": len(chunk_cmds),
+        "sha256_12": sha256_12,
+        "target_path": target_path,
+        "estimated_type_seconds": estimated_s,
+    }
+
+    if dry_run:
+        return {"ok": True, "dry_run": True, "written": False, "verified": False,
+                **meta}
+
+    if focus_shell:
+        await _do_open_shell(client, shell="powershell", verify=False)
+
+    old_timing = None
+    warnings: list[str] = []
+    if fast_timing:
+        try:
+            old_timing = client.get_timing()
+            client.set_timing({
+                "char_delay": type_inter_key_ms / 1000.0,
+                "type_key_hold": type_key_ms / 1000.0,
+                "type_shift": type_shift_ms / 1000.0,
+            })
+        except KvmClientError as e:
+            warnings.append(f"fast_timing not applied: {e}")
+            old_timing = None
+
+    verified_marker = False
+    verified_hash = False
+    try:
+        for i, cmd in enumerate(all_cmds):
+            _clear_input_line(client)
+            await asyncio.sleep(0.05)
+            client.type_text(cmd, raw=True)
+            await asyncio.sleep(0.1)
+            client.send_key("enter")
+            # Final command decodes + hashes; give it the longer wait.
+            await asyncio.sleep(
+                max(0.0, min(wait_seconds, _hard_max_wait()))
+                if i == len(all_cmds) - 1 else 0.15)
+
+        if verify:
+            try:
+                ocr_text = get_ocr().extract_text(
+                    _capture_image(), lang=cfg.get("ocr_fast_lang"))
+                if not _ocr_failed(ocr_text):
+                    upper = ocr_text.upper()
+                    verified_marker = "XFER_OK" in upper
+                    verified_hash = sha256_12 in upper
+            except Exception:
+                pass  # OCR failure is non-fatal
+    finally:
+        if old_timing is not None:
+            try:
+                client.set_timing(old_timing)
+            except KvmClientError as e:
+                warnings.append(f"timing restore failed: {e}")
+
+    return {
+        "ok": True,
+        "written": True,
+        "verified": verified_hash,
+        "verified_marker": verified_marker,
+        **meta,
+        "warning": "; ".join(warnings) if warnings else None,
+    }
+
+
 # Create MCP server
 app = Server("mcp-serial-hid-kvm")
 
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    """List available tools."""
-    return [
+    """List available tools (minus config.hidden_tools; hidden stay callable)."""
+    tools = [
         Tool(
             name="type_text",
             description=(
@@ -1773,13 +2146,245 @@ async def list_tools() -> list[Tool]:
                 "required": ["text"],
             },
         ),
+        Tool(
+            name="transfer_unicode_file",
+            description=(
+                "Write Unicode text (Japanese runbooks, templates, configs) to a FILE on the Target "
+                "as exact UTF-8 bytes (no BOM), via chunked Base64URL typed through PowerShell. "
+                "Verifies with SHA-256 (first 12 hex chars echoed on the target and OCR-checked). "
+                "Use paste_unicode_text for clipboard/short text; this tool for files or >1000 chars. "
+                "Call with dry_run=true first to see the time estimate."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "File content (Unicode OK). Written as UTF-8 without BOM.",
+                    },
+                    "target_path": {
+                        "type": "string",
+                        "description": "Absolute ASCII path on the target, e.g. C:\\Temp\\runbook.md. Single quotes are escaped; environment variables are NOT expanded.",
+                    },
+                    "chunk_chars": {
+                        "type": "integer",
+                        "description": "Base64 chars per Add-Content chunk (default 2500, min 100).",
+                    },
+                    "focus_shell": {
+                        "type": "boolean",
+                        "description": "Open/focus Target PowerShell first via Win+R (default true).",
+                    },
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": "Wait after the final decode command before verification (default 2.0).",
+                    },
+                    "fast_timing": {
+                        "type": "boolean",
+                        "description": "Temporarily speed up HID typing, then restore prior timing (default true).",
+                    },
+                    "type_key_ms": {
+                        "type": "integer",
+                        "description": "Per-key hold in ms when fast_timing=true (default 5).",
+                    },
+                    "type_inter_key_ms": {
+                        "type": "integer",
+                        "description": "Inter-key delay in ms when fast_timing=true (default 5).",
+                    },
+                    "type_shift_ms": {
+                        "type": "integer",
+                        "description": "Shift/modifier staging delay in ms when fast_timing=true (default 0).",
+                    },
+                    "max_text_chars": {
+                        "type": "integer",
+                        "description": "Safety cap for content length (default 8000; ~8000 CJK chars take several minutes over HID).",
+                    },
+                    "verify": {
+                        "type": "boolean",
+                        "description": "OCR the screen after writing and check the SHA-256 echo (default true).",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Return sizes/chunk count/time estimate without typing anything (default false).",
+                    },
+                },
+                "required": ["text", "target_path"],
+            },
+        ),
+        # -------------------------------------------------------------------
+        # Ops tools: evidence capture, long-running commands, multi-target,
+        # production interlock.
+        # -------------------------------------------------------------------
+        Tool(
+            name="save_evidence",
+            description=(
+                "Capture the target screen and save it on the HOST under a structured evidence path: "
+                "<evidence_dir>/<label>/<YYYYMMDD_HHMMSS>[_<step>].png. For work-evidence workflows "
+                "(e.g. label=INC51031_F56_ST22, step=before/after). Returns the saved path, never an image. "
+                "Evidence dir: SHKVM_EVIDENCE_DIR (default ~/Documents/kvm-evidence)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "label": {
+                        "type": "string",
+                        "description": "Folder label, e.g. INC51031_F56_ST22. Sanitized to [A-Za-z0-9_-].",
+                    },
+                    "step": {
+                        "type": "string",
+                        "description": "Optional step suffix, e.g. before, after, step3.",
+                    },
+                    "region": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional [x, y, w, h] region to save. Omit for full frame.",
+                    },
+                    "image_format": {
+                        "type": "string",
+                        "enum": ["png", "jpg"],
+                        "description": "png (default, lossless — best for evidence) or jpg.",
+                    },
+                    "quality": {
+                        "type": "integer",
+                        "description": "JPEG quality 1-100 when image_format=jpg (default 90).",
+                    },
+                },
+                "required": ["label"],
+            },
+        ),
+        Tool(
+            name="run_powershell_until_done",
+            description=(
+                "Run a LONG PowerShell command on the TARGET and poll locally until it finishes: appends an "
+                "OCR-safe completion marker (Write-Output of a split string), waits for the marker to appear, "
+                "then returns the terminal tail. Use for terraform plan/apply, kubectl rollout, installers etc. "
+                "instead of guessing wait_seconds. Timeout is capped by config max_wait_seconds "
+                "(raise it via configure for multi-minute commands)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "PowerShell command to run in the focused target shell.",
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": "Max seconds to poll for completion (default from config wait_timeout_seconds; capped by max_wait_seconds).",
+                    },
+                    "poll_ms": {
+                        "type": "integer",
+                        "description": "Delay between polls in ms (default from config wait_poll_ms).",
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Maximum output lines to return (default from config terminal_max_lines).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Maximum output characters to return (default from config terminal_max_chars).",
+                    },
+                    "lang": {
+                        "type": "string",
+                        "description": "OCR language override. Default from config ocr_fast_lang (eng).",
+                    },
+                },
+                "required": ["command"],
+            },
+        ),
+        Tool(
+            name="list_targets",
+            description="List the configured KVM targets (from SHKVM_TARGETS) and which one is currently active. No hardware access.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        Tool(
+            name="select_target",
+            description=(
+                "Switch the active KVM server (multi-PC setups: one serial-hid-kvm instance per target PC). "
+                "Pass a configured name (see list_targets) or an explicit host+port. Resets screen baseline "
+                "and cursor tracking, then pings the new target."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Configured target name from SHKVM_TARGETS (e.g. aws-pc, sap-pc).",
+                    },
+                    "host": {
+                        "type": "string",
+                        "description": "KVM server host (alternative to name).",
+                    },
+                    "port": {
+                        "type": "integer",
+                        "description": "KVM server port (alternative to name).",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="set_input_lock",
+            description=(
+                "Production interlock: when locked, every HID-generating tool (keyboard, mouse, run_*, paste/transfer) "
+                "is refused with error=input_locked, while capture/OCR/health stay available — safe read-only observation "
+                "of production screens. Unlocking requires confirm='UNLOCK'. In-memory only (cleared on MCP restart)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "locked": {
+                        "type": "boolean",
+                        "description": "true to lock input tools, false to unlock (needs confirm).",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the lock is set, e.g. 'observing PRD F56'. Echoed in refusals.",
+                    },
+                    "confirm": {
+                        "type": "string",
+                        "description": "Must be exactly 'UNLOCK' when unlocking.",
+                    },
+                },
+                "required": ["locked"],
+            },
+        ),
     ]
+    return [t for t in tools if t.name not in config.hidden_tools]
 
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
     """Handle tool calls."""
     try:
+        # Production interlock: refuse HID-generating tools while locked.
+        lock_error = _check_input_lock(name, arguments or {})
+        if lock_error is not None:
+            return [TextContent(type="text", text=json.dumps(lock_error, ensure_ascii=False))]
+
+        # Tools that must not depend on a (possibly dead) connection to the
+        # currently selected target.
+        if name == "set_input_lock":
+            result = _do_set_input_lock(
+                locked=bool(arguments["locked"]),
+                reason=arguments.get("reason"),
+                confirm=arguments.get("confirm"))
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "list_targets":
+            result = _do_list_targets()
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "select_target":
+            result = _do_select_target(
+                name=arguments.get("name"),
+                host=arguments.get("host"),
+                port=arguments.get("port"))
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
         client = get_client()
 
         if name == "type_text":
@@ -2210,6 +2815,44 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 max_text_chars=int(arguments.get("max_text_chars", 1200)),
                 dry_run=arguments.get("dry_run", False),
             )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "transfer_unicode_file":
+            result = await _do_transfer_unicode_file(
+                client,
+                text=arguments["text"],
+                target_path=arguments["target_path"],
+                chunk_chars=int(arguments.get("chunk_chars", _TRANSFER_DEFAULT_CHUNK)),
+                focus_shell=arguments.get("focus_shell", True),
+                wait_seconds=float(arguments.get("wait_seconds", 2.0)),
+                fast_timing=arguments.get("fast_timing", True),
+                type_key_ms=int(arguments.get("type_key_ms", 5)),
+                type_inter_key_ms=int(arguments.get("type_inter_key_ms", 5)),
+                type_shift_ms=int(arguments.get("type_shift_ms", 0)),
+                max_text_chars=int(arguments.get("max_text_chars", 8000)),
+                verify=arguments.get("verify", True),
+                dry_run=arguments.get("dry_run", False),
+            )
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "save_evidence":
+            result = _do_save_evidence(
+                label=arguments["label"],
+                step=arguments.get("step"),
+                region=arguments.get("region"),
+                image_format=arguments.get("image_format", "png"),
+                quality=int(arguments.get("quality", 90)))
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "run_powershell_until_done":
+            result = await _do_run_until_done(
+                client,
+                command=arguments["command"],
+                timeout_seconds=arguments.get("timeout_seconds"),
+                poll_ms=arguments.get("poll_ms"),
+                max_lines=arguments.get("max_lines"),
+                max_chars=arguments.get("max_chars"),
+                lang=arguments.get("lang"))
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
         else:
