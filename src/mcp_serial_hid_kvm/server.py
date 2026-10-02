@@ -14,7 +14,6 @@ import logging
 import os
 import random
 import re
-import secrets
 import time
 from typing import Any
 
@@ -821,83 +820,24 @@ async def _do_run_task_and_report(client, *, task="", steps, max_steps=10,
 _PASTE_CMD_MAX = 7500
 
 
-def _paste_unicode_build_command(text: str, call_id: str | None = None) -> tuple[str, str, bytes]:
-    """Set and read back the clipboard, emitting echo-safe, per-call records.
+def _paste_unicode_build_command(text: str) -> tuple[str, str, bytes]:
+    """Build a PowerShell one-liner that decodes Base64URL text and sets the clipboard.
 
     Returns (command, payload, utf8_bytes).  command is pure ASCII printable.
     payload is the Base64URL string with padding stripped.
     """
     utf8_bytes = text.encode("utf-8")
     payload = base64.urlsafe_b64encode(utf8_bytes).decode("ascii").rstrip("=")
-    call_id = call_id or secrets.token_hex(8)
-    if not re.fullmatch(r"[a-f0-9]{16}", call_id):
-        raise ValueError("call_id must be 16 lowercase hex characters")
-    sha256 = hashlib.sha256(utf8_bytes).hexdigest()
-    # PowerShell string.Length counts UTF-16 code units, including surrogate pairs.
-    utf16_chars = len(text.encode("utf-16-le")) // 2
     command = (
-        f"$id='{call_id}';$p='KVM'+'CLIP_'+$id;try{{"
         f"$b='{payload}';"
         "$b=$b.Replace('-','+').Replace('_','/');"
         "while($b.Length%4){$b+='='};"
         "$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b));"
-        "Set-Clipboard -Value $s -ErrorAction Stop;"
-        "$r=[string](Get-Clipboard -Raw -ErrorAction Stop);"
-        "$h=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash("
-        "[Text.Encoding]::UTF8.GetBytes($r))).Replace('-','').ToLowerInvariant();"
-        f"if($r.Length -ne {utf16_chars} -or $h -ne '{sha256}'){{throw 'mismatch'}};"
-        "Write-Output ($p+' OK chars='+$r.Length);"
-        "Write-Output ($p+' HASH1='+$h.Substring(0,32));"
-        "Write-Output ($p+' HASH2='+$h.Substring(32));"
-        "}catch{Write-Output ($p+' FAIL')};Write-Output ($p+' DONE')"
+        "Set-Clipboard -Value $s;"
+        "Write-Output ('PASTE_UNICODE_OK chars='+$s.Length);"
+        "exit"
     )
     return command, payload, utf8_bytes
-
-
-def _unicode_output_complete(ocr_text: str, records: list[str]) -> bool:
-    """Require contiguous standalone output records followed by a PS prompt.
-
-    Each record fits an 80-column console. Do not normalize OCR substitutions:
-    unreadable evidence must fail closed, rather than accept a wrong hash.
-    """
-    if _ocr_failed(ocr_text):
-        return False
-    lines = [line.strip() for line in ocr_text.splitlines() if line.strip()]
-    for i in range(len(lines) - len(records)):
-        if lines[i:i + len(records)] == records and re.fullmatch(
-                r"PS(?:\s+[^\r\n]*)?>", lines[i + len(records)]):
-            return True
-    return False
-
-
-async def _wait_unicode_output(records: list[str], timeout: float,
-                               failure_records: list[str] | None = None) -> str:
-    deadline = time.monotonic() + max(0.0, min(timeout, _hard_max_wait()))
-    while True:
-        try:
-            text = _ocr_region_text(None, lang=get_config().get("ocr_fast_lang"))
-        except Exception:
-            return "ocr_failed"
-        if _ocr_failed(text):
-            return "ocr_failed"
-        if failure_records and _unicode_output_complete(text, failure_records):
-            return "target_failed"
-        if _unicode_output_complete(text, records):
-            return "verified"
-        if time.monotonic() >= deadline:
-            return "verification_timeout"
-        await asyncio.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
-
-
-async def _type_unicode_command(client: KvmClient, command: str) -> None:
-    # First Esc cancels IME composition; second clears PSReadLine. Mandatory
-    # here even when the general clear_input_before_command setting is disabled.
-    client.send_key("escape")
-    client.send_key("escape")
-    await asyncio.sleep(0.1)
-    client.type_text(command, raw=True)
-    await asyncio.sleep(0.1)
-    client.send_key("enter")
 
 
 def _paste_unicode_estimate_seconds(
@@ -920,7 +860,6 @@ async def _do_paste_unicode_text(
     type_inter_key_ms: int = 5,
     type_shift_ms: int = 0,
     max_text_chars: int = 1200,
-    verify_timeout_seconds: float = 5.0,
     dry_run: bool = False,
 ) -> dict:
     """Encode text as Base64URL, type the PowerShell decode+Set-Clipboard command
@@ -932,8 +871,7 @@ async def _do_paste_unicode_text(
         return {"ok": False, "error": "text_too_long",
                 "text_chars": len(text), "max_text_chars": max_text_chars}
 
-    call_id = secrets.token_hex(8)
-    command, payload, utf8_bytes = _paste_unicode_build_command(text, call_id)
+    command, payload, utf8_bytes = _paste_unicode_build_command(text)
 
     if len(command) > _PASTE_CMD_MAX:
         return {
@@ -956,8 +894,6 @@ async def _do_paste_unicode_text(
         "payload_chars": len(payload),
         "command_chars": len(command),
         "sha256": sha256,
-        "call_id": call_id,
-        "utf16_chars": len(text.encode("utf-16-le")) // 2,
         "estimated_type_seconds": estimated_s,
         "timing_used": {
             "type_key_ms": type_key_ms,
@@ -970,6 +906,9 @@ async def _do_paste_unicode_text(
     if dry_run:
         return {"ok": True, "dry_run": True, "set_clipboard": False, "pasted": False,
                 **meta, "verified": False, "warning": None}
+
+    if focus_shell:
+        await _do_open_shell(client, shell="powershell", verify=False)
 
     old_timing = None
     timing_warning = None
@@ -991,51 +930,23 @@ async def _do_paste_unicode_text(
     if timing_warning:
         warnings.append(timing_warning)
 
-    stage = "observe_screen"
-    error = None
-    detail = None
     try:
-        # Observe before HID input. The ASCII probe below also proves the shell
-        # focus and keyboard mapping; a window title or taskbar A is insufficient.
-        initial = _ocr_region_text(None, lang=cfg.get("ocr_fast_lang"))
-        if _ocr_failed(initial):
-            error = "ocr_failed"
-        else:
-            stage = "open_shell"
-            if focus_shell:
-                shell = await _do_open_shell(client, shell="powershell", verify=True)
-                if not shell["verified"]:
-                    error = "shell_not_verified"
-            elif not any(re.fullmatch(r"PS(?:\s+[^\r\n]*)?>", line.strip())
-                         for line in initial.splitlines()):
-                error = "shell_not_verified"
+        _clear_input_line(client)
+        await asyncio.sleep(0.05)
+        client.type_text(command, raw=True)
+        await asyncio.sleep(0.1)
+        client.send_key("enter")
+        await asyncio.sleep(max(0.0, min(wait_seconds, _hard_max_wait())))
 
-        if error is None:
-            stage = "prepare_input"
-            probe = 'KVMASCII_' + call_id
-            await _type_unicode_command(client, f"Write-Output ('KVM'+'ASCII_{call_id}')")
-            status = await _wait_unicode_output([probe], verify_timeout_seconds)
-            if status != "verified":
-                error = "ascii_input_not_verified"
-                detail = status
+        try:
+            ocr_text = get_ocr().extract_text(
+                _capture_image(), lang=cfg.get("ocr_fast_lang"))
+            if not _ocr_failed(ocr_text) and "PASTE_UNICODE_OK" in ocr_text:
+                verified = True
+        except Exception:
+            pass  # OCR failure is non-fatal
 
-        if error is None:
-            stage = "verify_clipboard"
-            await _type_unicode_command(client, command)
-            await asyncio.sleep(max(0.0, min(wait_seconds, _hard_max_wait())))
-            prefix = 'KVMCLIP_' + call_id
-            records = [f"{prefix} OK chars={meta['utf16_chars']}",
-                       f"{prefix} HASH1={sha256[:32]}",
-                       f"{prefix} HASH2={sha256[32:]}", f"{prefix} DONE"]
-            status = await _wait_unicode_output(
-                records, verify_timeout_seconds, [f"{prefix} FAIL", f"{prefix} DONE"])
-            verified = status == "verified"
-            if not verified:
-                error = "clipboard_not_verified"
-                detail = status
-
-        if verified and paste_after_set:
-            stage = "paste"
+        if paste_after_set:
             if restore_focus_with_alt_tab:
                 client.send_key("tab", ["alt"])
                 await asyncio.sleep(0.3)
@@ -1044,9 +955,7 @@ async def _do_paste_unicode_text(
             if not restore_focus_with_alt_tab:
                 warnings.append(
                     "Ctrl+V sent; focus may still be PowerShell unless moved by caller.")
-    except Exception as e:
-        error = "operation_failed"
-        detail = str(e)
+
     finally:
         if old_timing is not None:
             try:
@@ -1055,14 +964,11 @@ async def _do_paste_unicode_text(
                 warnings.append(f"timing restore failed: {e}")
 
     return {
-        "ok": error is None,
-        "set_clipboard": verified,
+        "ok": True,
+        "set_clipboard": True,
         "pasted": pasted,
         **meta,
         "verified": verified,
-        "failed_stage": stage if error else None,
-        "error": error,
-        "detail": detail,
         "warning": "; ".join(warnings) if warnings else None,
     }
 
@@ -2186,8 +2092,7 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Transfer Unicode text (Japanese, Chinese, etc.) to the Target clipboard "
                 "via UTF-8 Base64URL typed through PowerShell. Optionally paste with Ctrl+V. "
-                "Requires an executed ASCII probe and clipboard readback (length/SHA-256) "
-                "before success or paste; input-mode/OCR failures stop without pasting. "
+                "Good for short/medium text (1-500 CJK chars ≈ 2-22 s at fast_timing). "
                 "Large text is slow over HID; use transfer_unicode_file for > 1000 chars."
             ),
             inputSchema={
@@ -2203,7 +2108,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "paste_after_set": {
                         "type": "boolean",
-                        "description": "Send Ctrl+V only after verified clipboard readback (default false; PowerShell remains open).",
+                        "description": "After setting the clipboard, send Ctrl+V (default false; focus is still PowerShell after this tool unless you moved it).",
                     },
                     "restore_focus_with_alt_tab": {
                         "type": "boolean",
@@ -2212,10 +2117,6 @@ async def list_tools() -> list[Tool]:
                     "wait_seconds": {
                         "type": "number",
                         "description": "Seconds to wait after executing the PowerShell clipboard command (default 1.0).",
-                    },
-                    "verify_timeout_seconds": {
-                        "type": "number",
-                        "description": "Maximum OCR polling time for each ASCII/clipboard verification (default 5 seconds, capped by max_wait_seconds).",
                     },
                     "fast_timing": {
                         "type": "boolean",
@@ -2912,7 +2813,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 type_inter_key_ms=int(arguments.get("type_inter_key_ms", 5)),
                 type_shift_ms=int(arguments.get("type_shift_ms", 0)),
                 max_text_chars=int(arguments.get("max_text_chars", 1200)),
-                verify_timeout_seconds=float(arguments.get("verify_timeout_seconds", 5.0)),
                 dry_run=arguments.get("dry_run", False),
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]

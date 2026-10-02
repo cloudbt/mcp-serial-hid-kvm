@@ -150,7 +150,6 @@ commands, multi-PC setups, and a production-safety interlock.
 | `save_evidence` | Capture and save a screenshot on the **host** under `<evidence_dir>/<label>/<timestamp>[_<step>].png` — structured evidence for incident/change work (e.g. `label=INC51031_F56_ST22`, `step=before`) |
 | `run_powershell_until_done` | Run a long target command (terraform, installers, batch jobs) with an OCR-safe completion marker appended; polls locally until the marker appears, then returns the terminal tail. No more guessing `wait_seconds` |
 | `transfer_unicode_file` | Write Unicode text (Japanese runbooks, templates) to a **file** on the target as exact UTF-8 bytes via chunked Base64 typing; SHA-256 verified. Companion to `paste_unicode_text` (clipboard) |
-| `paste_unicode_text` | Set Unicode clipboard text through Target PowerShell. Requires a per-call ASCII execution probe and clipboard readback with full SHA-256 before reporting success or sending optional Ctrl+V |
 | `list_targets` | List configured KVM targets (`SHKVM_TARGETS`) and the active one |
 | `select_target` | Switch the active KVM server by name or host:port (one serial-hid-kvm instance per target PC); resets baseline/cursor tracking and pings the new target |
 | `set_input_lock` | Production interlock: while locked, all HID-generating tools are refused (capture/OCR stay available) — safe read-only observation of production screens. Unlock requires `confirm='UNLOCK'` |
@@ -163,32 +162,6 @@ on the target keyboard layout matching the KVM server's `--target-layout`. On a
 mismatched layout (e.g. a JP-layout target with `us104`), double quotes may not
 arrive as ASCII straight quotes; prefer simple unquoted commands, or base64 for
 complex payloads. These tools never execute anything on the **host**.
-
-`paste_unicode_text` cancels pending IME composition and clears the input line,
-then runs a harmless ASCII probe. It does not blindly toggle the IME. If Japanese
-full-width/kana mode, a mismatched keyboard layout, or lost focus prevents the
-probe from executing, it returns `ok: false`, `set_clipboard: false`,
-`verified: false`, and `pasted: false`, with `failed_stage` and `detail`. Switch
-the Target to half-width alphanumeric (`A`/ENG), check the KVM keyboard layout,
-and retry after inspecting the screen.
-
-Clipboard success requires standalone output for this call's random ID, the
-readback's UTF-16 length and full UTF-8 SHA-256, a completion record, and a returned
-default PowerShell `PS ...>` prompt. The command echo and earlier calls cannot
-satisfy verification. Hash output is split into two lines to fit an 80-column
-console. OCR failure, timeout, readback mismatch, or a missing completion/prompt
-blocks automatic paste, even with `paste_after_set: true`. Verification is
-mandatory; `verify_timeout_seconds` (default 5, capped by `max_wait_seconds`)
-controls each polling phase. `text_chars` counts Unicode code points;
-`utf16_chars` is the count checked against PowerShell's string length.
-
-PowerShell stays open so its output can be verified. To return to the previous
-app and paste, use `paste_after_set: true` with
-`restore_focus_with_alt_tab: true`. Confirm the destination app beforehand and
-inspect the resulting draft; `pasted` records Ctrl+V delivery, not destination
-content verification. The tool never sends a message. Custom prompts or an
-unreadable console fail verification; this tool does not change or restore IME
-mode. `dry_run: true` only returns metadata and performs no HID/clipboard actions.
 
 ## Direct API Scripts (no MCP / no AI)
 
