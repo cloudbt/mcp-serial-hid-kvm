@@ -548,11 +548,15 @@ async def _do_open_shell(client, *, shell="powershell", distro=None, method="win
     if method == "win_r":
         client.send_key("r", ["win"])
         await asyncio.sleep(0.6)
+        client.send_key("0x91")  # Japanese IME Off: half-width alphanumeric.
+        await asyncio.sleep(0.15)
         client.type_text("powershell", raw=True)
         await asyncio.sleep(0.2)
         client.send_key("enter")
         detail = "Win+R -> powershell"
     else:  # type_command
+        client.send_key("0x91")
+        await asyncio.sleep(0.15)
         client.type_text("powershell", raw=True)
         await asyncio.sleep(0.1)
         client.send_key("enter")
@@ -931,6 +935,8 @@ async def _do_paste_unicode_text(
         warnings.append(timing_warning)
 
     try:
+        client.send_key("0x91")  # The shell may have its own IME state.
+        await asyncio.sleep(0.15)
         _clear_input_line(client)
         await asyncio.sleep(0.05)
         client.type_text(command, raw=True)
@@ -1296,6 +1302,8 @@ async def _do_transfer_unicode_file(
     verified_marker = False
     verified_hash = False
     try:
+        client.send_key("0x91")
+        await asyncio.sleep(0.15)
         for i, cmd in enumerate(all_cmds):
             _clear_input_line(client)
             await asyncio.sleep(0.05)
