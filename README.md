@@ -73,13 +73,23 @@ Custom KVM server address:
 |----------|---------|-------------|
 | `SHKVM_API_HOST` | `127.0.0.1` | KVM server address |
 | `SHKVM_API_PORT` | `9329` | KVM server port |
-| `SHKVM_TARGETS` | (none) | Named KVM targets for `select_target`, JSON: `{"aws-pc": "127.0.0.1:9329", "sap-pc": "127.0.0.1:9331"}` |
+| `SHKVM_TARGETS` | shared file if present | Named KVM targets for `select_target`, JSON: `{"target1": "127.0.0.1:9329", "target2": "127.0.0.1:9331"}` |
+| `SHKVM_TARGETS_CONFIG` | `%LOCALAPPDATA%/serial-hid-kvm/targets.json` | Shared NanoKVM bindings file; only API endpoints are read by MCP |
 | `SHKVM_OCR_CMD` | auto-detect | Path to tesseract executable |
 | `SHKVM_CAPTURE_LOG_DIR` | platform default | Capture log directory (empty string to disable) |
 | `SHKVM_EVIDENCE_DIR` | `~/Documents/kvm-evidence` | `save_evidence` output directory (empty string to disable) |
 | `SHKVM_HIDDEN_TOOLS` | superseded/setup tools | Comma-separated tool names to hide from `list_tools` (still callable). `none` shows everything. Default hides: `execute_and_read`, `get_screen_text`, `screen_changed`, `send_key_sequence`, `list_capture_devices`, `set_capture_device`, `set_capture_resolution` |
 
 Hardware settings (`SHKVM_SERIAL_PORT`, `SHKVM_SCREEN_WIDTH`, etc.) are configured on the **KVM server side**, not here. If the target PC uses a non-US keyboard, set `--target-layout` (or `SHKVM_TARGET_LAYOUT`) on the KVM server so that `type_text` and `send_key` produce correct characters.
+
+For two PCs, start independent KVM servers on ports 9329 and 9331. Reconnect
+MCP after changing its environment or shared configuration, then call
+`list_targets` and `select_target(name="target1")` / `select_target(name="target2")`.
+An unreachable new Target leaves the current connection intact. Successful
+switches clear the previous Target's screen/coordinate/terminal caches and keep
+the input lock. Capture a fresh screen before sending input. Each MCP process
+has one active Target; use separate MCP processes or `set_input_lock` when
+multiple callers might switch and control Targets concurrently.
 
 ## Available Tools
 

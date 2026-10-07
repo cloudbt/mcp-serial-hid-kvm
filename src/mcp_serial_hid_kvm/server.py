@@ -1048,12 +1048,20 @@ def _do_select_target(*, name=None, host=None, port=None) -> dict:
                 "detail": "Pass name (see list_targets), or host and port."}
     else:
         name = f"{host}:{port}"
+    candidate = KvmClient(host, int(port))
+    try:
+        candidate.ping()
+    except Exception as e:
+        candidate.close()
+        return {"ok": False, "target": name, "host": host, "port": int(port),
+                "ping": False, "error": "ping_failed", "detail": str(e),
+                "current": dict(_current_target)}
     if _client is not None:
         try:
             _client.close()
         except Exception:
             pass
-        _client = None
+    _client = candidate
     # Baselines, screen size and cursor tracking belong to the old target.
     _baseline = None
     _screen_size = None
@@ -1061,14 +1069,8 @@ def _do_select_target(*, name=None, host=None, port=None) -> dict:
     _focused_shell_hint = None
     _current_target = {"name": name, "host": host, "port": int(port)}
     result = {"ok": True, "target": name, "host": host, "port": int(port)}
-    try:
-        get_client().ping()
-        result["ping"] = True
-    except Exception as e:
-        result["ok"] = False
-        result["ping"] = False
-        result["error"] = "ping_failed"
-        result["detail"] = str(e)
+    _apply_hardware_timing(candidate)
+    result["ping"] = True
     return result
 
 

@@ -8,6 +8,35 @@ import platform
 logger = logging.getLogger(__name__)
 
 
+def targets_file_json(path: str | None = None) -> str | None:
+    """Load the shared two-KVM bindings' API endpoints without hardware access.
+
+    Enables named targets even when the MCP is launched directly with Python,
+    rather than through the repository's PowerShell bootstrap script.
+    """
+    path = path or os.environ.get("SHKVM_TARGETS_CONFIG")
+    if not path:
+        base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local"))
+        path = os.path.join(base, "serial-hid-kvm", "targets.json")
+    try:
+        with open(path, encoding="utf-8-sig") as source:
+            data = json.load(source)
+        if data.get("version") != 1 or not isinstance(data.get("targets"), dict):
+            raise ValueError("invalid multi-target file schema")
+        result = {}
+        for name, spec in data["targets"].items():
+            port = spec["api_port"]
+            if type(port) is not int or not 1 <= port <= 65535:
+                raise ValueError("invalid API port")
+            result[name] = {"host": "127.0.0.1", "port": port}
+        return json.dumps(result)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        logger.warning(f"Ignoring multi-target file {path}: {exc}")
+        return None
+
+
 def _default_capture_log_dir() -> str:
     """Return the platform-appropriate default directory for capture logs."""
     if platform.system() == "Windows":
@@ -89,8 +118,10 @@ class Config:
         self.kvm_port: int = int(os.environ.get("SHKVM_API_PORT", "9329"))
 
         # Named KVM targets for select_target (multi-PC setups)
-        self.targets: dict = parse_targets(
-            os.environ.get("SHKVM_TARGETS"), self.kvm_host, self.kvm_port)
+        raw_targets = os.environ.get("SHKVM_TARGETS")
+        if raw_targets is None:
+            raw_targets = targets_file_json()
+        self.targets: dict = parse_targets(raw_targets, self.kvm_host, self.kvm_port)
 
         # Local OCR
         self.tesseract_cmd: str | None = os.environ.get("SHKVM_OCR_CMD")
