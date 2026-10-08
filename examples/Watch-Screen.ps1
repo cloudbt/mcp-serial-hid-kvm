@@ -9,7 +9,7 @@ SM37 job screens, installers - anything you'd otherwise babysit.
 
 The change detection is a lightweight heuristic (compressed-size delta), not a
 pixel diff. It reliably catches "lots of new text / window changed" and stays
-dependency-free; use the MCP wait_for_screen_change tool when you need a real
+dependency-free; use the MCP wait_for_change tool when you need a real
 pixel diff.
 
 .EXAMPLE

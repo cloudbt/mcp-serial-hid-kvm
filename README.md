@@ -1,204 +1,225 @@
 # mcp-serial-hid-kvm
 
-MCP (Model Context Protocol) server that gives AI agents full keyboard, mouse, and screen access to a physical PC. Thin client for [serial-hid-kvm](https://github.com/sunasaji/serial-hid-kvm) — all hardware control is delegated via TCP.
+MCP server for keyboard, mouse, capture and image-state detection on physical
+Target PCs. Hardware operations delegate to [serial-hid-kvm](https://github.com/cloudbt/serial-hid-kvm) over JSON Lines TCP.
 
-## How It Works
-
-```
-Claude / AI Agent
-  ↕ MCP (stdio)
-mcp-serial-hid-kvm        ← this package (thin client + OCR)
-  ↕ TCP (localhost:9329)
-serial-hid-kvm             ← standalone KVM server (owns hardware)
-  ↕ USB Serial + HDMI
-Target PC
-```
-
-The KVM server (`serial-hid-kvm`) runs as a persistent process owning the serial port and capture device. This MCP server connects to it as a TCP client. Multiple MCP instances (multiple Claude sessions) can share a single KVM server without device conflicts.
-
-## Prerequisites
-
-1. **Hardware**: CH9329+CH340 USB HID cable + USB HDMI capture device (see [serial-hid-kvm](https://github.com/sunasaji/serial-hid-kvm) for details)
-2. **serial-hid-kvm** installed and running:
-   ```bash
-   pip install -e /path/to/serial-hid-kvm
-   serial-hid-kvm --api              # with preview window
-   serial-hid-kvm --api --headless   # or headless
-   ```
-3. **Tesseract OCR** (for `get_screen_text` / `execute_and_read`):
-   - Linux: `sudo apt install tesseract-ocr`
-   - Windows: https://github.com/tesseract-ocr/tesseract
-
-## Installation
-
-```bash
-pip install -e .
-```
-
-This automatically installs `serial-hid-kvm` as a dependency.
-
-## MCP Client Configuration
-
-### Claude Desktop / Claude Code
-
-```json
-{
-  "mcpServers": {
-    "kvm": {
-      "command": "mcp-serial-hid-kvm"
-    }
-  }
-}
-```
-
-Custom KVM server address:
-
-```json
-{
-  "mcpServers": {
-    "kvm": {
-      "command": "mcp-serial-hid-kvm",
-      "env": {
-        "SHKVM_API_HOST": "127.0.0.1",
-        "SHKVM_API_PORT": "9329"
-      }
-    }
-  }
-}
-```
-
-## Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SHKVM_API_HOST` | `127.0.0.1` | KVM server address |
-| `SHKVM_API_PORT` | `9329` | KVM server port |
-| `SHKVM_TARGETS` | shared file if present | Named KVM targets for `select_target`, JSON: `{"target1": "127.0.0.1:9329", "target2": "127.0.0.1:9331"}` |
-| `SHKVM_TARGETS_CONFIG` | `%LOCALAPPDATA%/serial-hid-kvm/targets.json` | Shared NanoKVM bindings file; only API endpoints are read by MCP |
-| `SHKVM_OCR_CMD` | auto-detect | Path to tesseract executable |
-| `SHKVM_CAPTURE_LOG_DIR` | platform default | Capture log directory (empty string to disable) |
-| `SHKVM_EVIDENCE_DIR` | `~/Documents/kvm-evidence` | `save_evidence` output directory (empty string to disable) |
-| `SHKVM_HIDDEN_TOOLS` | superseded/setup tools | Comma-separated tool names to hide from `list_tools` (still callable). `none` shows everything. Default hides: `execute_and_read`, `get_screen_text`, `screen_changed`, `send_key_sequence`, `list_capture_devices`, `set_capture_device`, `set_capture_resolution` |
-
-Hardware settings (`SHKVM_SERIAL_PORT`, `SHKVM_SCREEN_WIDTH`, etc.) are configured on the **KVM server side**, not here. If the target PC uses a non-US keyboard, set `--target-layout` (or `SHKVM_TARGET_LAYOUT`) on the KVM server so that `type_text` and `send_key` produce correct characters.
-
-For two PCs, start independent KVM servers on ports 9329 and 9331. Reconnect
-MCP after changing its environment or shared configuration, then call
-`list_targets` and `select_target(name="target1")` / `select_target(name="target2")`.
-An unreachable new Target leaves the current connection intact. Successful
-switches clear the previous Target's screen/coordinate/terminal caches and keep
-the input lock. Capture a fresh screen before sending input. Each MCP process
-has one active Target; use separate MCP processes or `set_input_lock` when
-multiple callers might switch and control Targets concurrently.
-
-## Available Tools
-
-Tools marked *(hidden by default)* are superseded or setup-time tools filtered
-out of `list_tools` via `SHKVM_HIDDEN_TOOLS` defaults — they remain callable
-and can be re-exposed with `SHKVM_HIDDEN_TOOLS=none`.
-
-### Keyboard
-
-| Tool | Description |
-|------|-------------|
-| `type_text` | Type text with inline tags: `ls -la{enter}`, `{ctrl+c}`, `{alt+f4}`. Whitelist-based: unknown `{content}` passes through literally. Raw mode (`raw=true`) disables tags; actual line breaks become Enter. `char_delay_ms`: delay between keystrokes in ms (default: 20). Only ASCII printable characters, tab, and line breaks are supported; unsupported characters (Unicode, CJK, etc.) cause an error — use base64 encoding as a workaround |
-| `send_key` | Single key press with modifiers |
-| `send_key_sequence` *(hidden by default)* | Multiple key steps with per-step delays. `default_delay_ms`: delay between steps in ms (default: 100); each step can override with `delay_ms` |
-
-### Mouse
-
-| Tool | Description |
-|------|-------------|
-| `mouse_move` | Move cursor (absolute or relative) |
-| `mouse_click` | Click at optional position |
-| `mouse_drag` | Drag from one position to another (drag-and-drop, text selection, etc.) |
-| `mouse_scroll` | Scroll wheel |
-
-### Screen
-
-| Tool | Description |
-|------|-------------|
-| `capture_screen` | Capture screen as image (high token cost) |
-| `get_screen_text` *(hidden by default)* | Capture + OCR to text (preferred for text content) |
-| `execute_and_read` *(hidden by default)* | Type command, Enter, wait, capture + OCR |
-
-### Device Management
-
-| Tool | Description |
-|------|-------------|
-| `get_device_info` | Serial port, capture device, config info |
-| `list_capture_devices` *(hidden by default)* | List available video devices |
-| `set_capture_device` *(hidden by default)* | Switch capture device |
-| `set_capture_resolution` *(hidden by default)* | Change capture resolution |
-
-### Token-Efficient Wrapper Tools
-
-These layer on the same KVM client + local OCR and return **compact JSON, never
-images**. They move repeated loops, OCR post-processing, screen diffing, and
-coordinate lookup into local code so agents spend fewer tokens. Every
-text-returning tool is bounded (`max_lines` / `max_chars`) and every wait is
-capped (60 s).
-
-| Tool | Description |
-|------|-------------|
-| `health` | Compact readiness for the whole stack: `{ok, api, serial, video, ocr, capture_device, resolution, errors}` |
-| `set_screen_baseline` | Capture the current frame into an in-memory baseline. Optional `region` = `[x,y,w,h]`. Returns `{ok, width, height, timestamp}` |
-| `screen_changed` *(hidden by default)* | Diff current frame vs. baseline. Returns only `{changed, score, threshold}`. `auto_baseline=true` seeds a baseline if none exists |
-| `get_screen_text_compact` | OCR the screen, normalize whitespace, bound by `max_lines`/`max_chars`. Returns `{text, line_count, truncated}` |
-| `detect_text_elements` | Tesseract TSV → text boxes `{text, x, y, w, h, confidence}` for local click targeting. Optional `query` substring filter, `min_confidence`, `region` |
-| `click_text` | Find text via OCR boxes and click its center. `match` = `contains`/`exact`, `index`, `dry_run=true` returns the coordinate without clicking |
-| `run_powershell_and_read` | Type a PowerShell command on the **target** via HID, wait, OCR the result. `{command, wait_seconds, max_lines, max_chars}` |
-| `run_wsl_and_read` | Same, wrapped as `wsl.exe -d <distro> -- bash -lc "<command>"`. `{command, distro, wait_seconds, max_lines, max_chars}` |
-
-### Ops Tools
-
-Operational tools for real-world workflows: evidence capture, long-running
-commands, multi-PC setups, and a production-safety interlock.
-
-| Tool | Description |
-|------|-------------|
-| `save_evidence` | Capture and save a screenshot on the **host** under `<evidence_dir>/<label>/<timestamp>[_<step>].png` — structured evidence for incident/change work (e.g. `label=INC51031_F56_ST22`, `step=before`) |
-| `run_powershell_until_done` | Run a long target command (terraform, installers, batch jobs) with an OCR-safe completion marker appended; polls locally until the marker appears, then returns the terminal tail. No more guessing `wait_seconds` |
-| `transfer_unicode_file` | Write Unicode text (Japanese runbooks, templates) to a **file** on the target as exact UTF-8 bytes via chunked Base64 typing; SHA-256 verified. Companion to `paste_unicode_text` (clipboard) |
-| `list_targets` | List configured KVM targets (`SHKVM_TARGETS`) and the active one |
-| `select_target` | Switch the active KVM server by name or host:port (one serial-hid-kvm instance per target PC); resets baseline/cursor tracking and pings the new target |
-| `set_input_lock` | Production interlock: while locked, all HID-generating tools are refused (capture/OCR stay available) — safe read-only observation of production screens. Unlock requires `confirm='UNLOCK'` |
-
-**Command-tool limitations:** `run_powershell_and_read` / `run_wsl_and_read`
-drive the target purely through HID typing + screen OCR — there is no target-side
-agent. They assume a shell is **already focused** on the target. Correct
-delivery of special characters (notably the `"` used by the WSL wrapper) depends
-on the target keyboard layout matching the KVM server's `--target-layout`. On a
-mismatched layout (e.g. a JP-layout target with `us104`), double quotes may not
-arrive as ASCII straight quotes; prefer simple unquoted commands, or base64 for
-complex payloads. These tools never execute anything on the **host**.
-
-## Direct API Scripts (no MCP / no AI)
-
-The KVM server's TCP API can be scripted directly — see [examples/](examples/)
-for stdlib-only Python and PowerShell scripts (health check, evidence
-screenshots, command + capture, Unicode clipboard transfer, screen watcher).
-Useful when an AI agent is unnecessary or not allowed for the data involved.
+**Vision interpretation belongs to the calling AI model.**
+**mcp-serial-hid-kvm does NOT perform OCR or semantic UI understanding.**
+The MCP server never calls a Vision model or imports a model SDK. Text, buttons,
+window identity and command outcomes are interpreted by the MCP Client / Agent.
 
 ## Architecture
 
-This package is intentionally minimal (~4 files):
-
+```text
+Vision Model / Agent (screen interpretation and action decisions)
+  ↕ MCP stdio
+mcp-serial-hid-kvm   (capture + HID + OpenCV image state)
+  ↕ TCP localhost:9329
+serial-hid-kvm      (owns serial adapter and HDMI capture)
+  ↕ USB serial + HDMI
+Target PC
 ```
-mcp_serial_hid_kvm/
-  server.py    MCP tool handlers → KvmClient TCP calls
-  config.py    KVM host/port, tesseract, log settings
-  ocr.py       Tesseract OCR (runs locally on fetched frames)
-  __init__.py
+
+```text
+src/mcp_serial_hid_kvm/
+  server.py          MCP handlers → KvmClient calls
+  config.py          endpoints, targets.json, capture/evidence settings
+  runtime_config.py  timing and wait defaults
+  vision/state.py    transport-independent image/frame algorithms and waits
+  vision/tools.py    MCP image-state schemas
 ```
 
-All keyboard/mouse/capture logic lives in `serial-hid-kvm`. This package only translates MCP tool calls to TCP API calls and runs OCR locally.
+The image pipeline crops an optional ROI, downscales to at most 480 pixels wide
+while keeping aspect ratio, converts to grayscale, then applies Gaussian blur,
+absdiff, pixel-delta threshold (20), morphology and connected-component filtering.
+JPEG bytes are never compared. Components below 0.001 of the ROI or below nine
+processed pixels are ignored by default. This reduces capture/compression noise,
+small cursor changes, blinking carets and small animations. Large animations
+still count; select an ROI or tune thresholds. The engine accepts PIL images or
+uint8 numpy frames in OpenCV BGR/BGRA/grayscale format.
 
-### Why Separate?
+## Installation
 
-- **No device conflicts** — multiple Claude sessions share one KVM server
-- **Independent restarts** — restart the MCP server without losing the KVM connection
-- **Standalone use** — `serial-hid-kvm` works without MCP (interactive preview, scripts, other AI frameworks)
+Requires Python 3.10+, CH9329-compatible HID, HDMI capture and a running TCP server:
+
+```bash
+pip install -e /path/to/serial-hid-kvm
+serial-hid-kvm --api --headless
+pip install -e .
+```
+
+Dependencies: `serial-hid-kvm`, `mcp>=1.0.0`, `pillow>=10.0.0`, `numpy>=1.24.0`,
+`opencv-python>=4.8.0`. OpenCV matches the hardware server; do not install
+`opencv-python-headless` alongside it. No external text-recognition executable
+or language files are required.
+
+## MCP client configuration
+
+```json
+{
+  "mcpServers": {
+    "kvm": {
+      "command": "python",
+      "args": ["-m", "mcp_serial_hid_kvm.server"],
+      "env": {"SHKVM_API_HOST": "127.0.0.1", "SHKVM_API_PORT": "9329"}
+    }
+  }
+}
+```
+
+Use your virtualenv Python path when needed. The `mcp-serial-hid-kvm` console
+entry point is also available.
+
+## Agent loop
+
+```text
+capture_screen (also stores the full capture as the pre-action baseline)
+→ Vision model decides action
+→ mouse_click / send_key / type_text
+→ wait_for_change
+→ wait_for_stable
+→ capture_screen
+→ Vision model verifies result
+```
+
+Capture before acting: `auto_baseline=true` seeds a missing baseline from the
+first polling frame. An immediate change that occurred before that frame cannot
+be recovered. `set_screen_baseline` explicitly sets a reference without returning
+an image. Change comparisons retain the reference; optional
+`update_baseline_on_change=true` replaces it on detection. Stability uses
+consecutive frames and does not change the action baseline.
+
+**Stable does not mean loaded, successful or command-complete.** A static error
+page, stalled loader, or command with no visible output can all look stable.
+The calling model must inspect the final capture.
+
+## Available tools
+
+29 tools are callable; 23 are advertised by default. Six tools marked hidden
+are setup tools or compatibility aliases. `SHKVM_HIDDEN_TOOLS=none` advertises
+all retained tools; removed tools cannot be exposed or invoked.
+
+| Tool | Purpose |
+|---|---|
+| `type_text` | ASCII HID, inline tags, optional raw mode; actual newlines press Enter |
+| `send_key` | One HID key with optional modifiers |
+| `send_key_sequence` *(hidden)* | Multiple HID steps with delays |
+| `mouse_move` | Absolute/relative HID cursor movement |
+| `mouse_click` | Optional coordinate and button |
+| `mouse_drag` | Press, move, release |
+| `mouse_scroll` | Wheel movement |
+| `capture_screen` | JPEG image and full-frame baseline |
+| `set_screen_baseline` | Full capture and optional default ROI; compact metadata |
+| `wait_for_change` | Wait against baseline; `{changed,score,elapsed_ms,attempts,regions}` |
+| `wait_for_stable` | N consecutive low-change comparisons; `{stable,score,elapsed_ms,attempts,stable_frames}` |
+| `get_changed_regions` | Filtered `{x,y,w,h,area_ratio}` boxes and score |
+| `screen_changed` *(hidden, deprecated)* | Alias of `get_changed_regions`, same OpenCV engine |
+| `wait_for_screen_change` *(hidden, deprecated)* | Alias of `wait_for_change`, same OpenCV engine |
+| `cursor_crop` | Image crop around explicit or tracked capture coordinates |
+| `health` | `{ok,api,serial,video,capture_device,resolution,target,input_locked,errors}` |
+| `get_device_info` | Serial/capture/HID configuration |
+| `list_capture_devices` *(hidden)* | Capture-device inventory |
+| `set_capture_device` *(hidden)* | Select device; invalidate image state on success |
+| `set_capture_resolution` *(hidden)* | Request resolution; invalidate image state on success |
+| `open_shell` | HID shell launch only; `verified=false`, calling model verifies focus |
+| `paste_unicode_text` | Base64URL → Target clipboard; dry-run sizes, SHA-256 and timing estimate |
+| `transfer_unicode_file` | Chunked Base64URL → Target UTF-8 file; dry-run sizes and expected hash prefix |
+| `save_evidence` | Save capture/ROI to Host evidence directory |
+| `list_targets` | Configured endpoints and active Target |
+| `select_target` | Ping before switching; keep old connection if unreachable |
+| `set_input_lock` | Refuse HID tools; unlock requires `confirm="UNLOCK"` |
+| `configure` | Runtime defaults/HID timing, optional persistence |
+| `get_timing` | Effective defaults and source metadata |
+
+### Image-state parameters
+
+| Parameter | Meaning / default |
+|---|---|
+| `timeout_seconds` | 30; capped by runtime `max_wait_seconds` (60); 0 performs one observation |
+| `poll_ms` | 200 ms delay between fresh captures; capture/processing time adds to cadence |
+| `threshold` | Changed-pixel fraction of ROI; change `score > threshold` (0.02), stable `score <= threshold` (0.001) |
+| `region` | Optional `[x,y,w,h]` in original capture pixels; positive size, fully inside frame |
+| `min_changed_area` | Minimum connected-component area / ROI area; default 0.001 |
+| `stable_frames` | Consecutive low-change comparisons, default 4; requires at least N+1 frames |
+| `auto_baseline` | Change wait: true; one-shot regions: false |
+| `update_baseline_on_change` | Optional change-wait/legacy parameter; false |
+
+Score and `area_ratio` use retained component pixels / ROI pixels, rather than
+bounding-box area. Boxes round outwards and map to **original capture resolution**
+including ROI offsets. Capture coordinates may differ from HID dimensions; map
+using `get_device_info` before clicking.
+
+Change waits inherit the ROI saved by `set_screen_baseline` when no ROI is supplied.
+Stable waits use the supplied ROI or full screen. Resolution mismatch is an error
+requiring a fresh capture/baseline; different frame sizes are never silently
+resized into comparable contexts. Timeout returns the last score and
+`timed_out=true`. Capture/transport failures remain errors.
+
+### Unicode and verification
+
+Payloads are encoded on the Host and typed into Target PowerShell. Temporary
+hardware timing is restored in `finally`; `dry_run=true` never sends input.
+Clipboard results report `clipboard_requested=true, set_clipboard=null,
+verified=false`; file results report `write_requested=true, written=null,
+verified=false`. Delivery attempts do not claim target execution or verification.
+The Target still echoes a marker/hash prefix for the calling model to inspect.
+
+Automatic paste was removed: legacy `paste_after_set=true` returns
+`vision_verification_required` before HID input. Capture and verify the clipboard
+operation and intended field, then send Ctrl+V separately. `open_shell` and file
+transfer no longer offer server-side `verify` parameters.
+
+## Configuration and multiple Targets
+
+| Variable | Default / purpose |
+|---|---|
+| `SHKVM_API_HOST` / `SHKVM_API_PORT` | `127.0.0.1` / `9329` |
+| `SHKVM_TARGETS` | Named endpoint JSON, e.g. `{"target1":"127.0.0.1:9329","target2":"127.0.0.1:9331"}` |
+| `SHKVM_TARGETS_CONFIG` | Shared `%LOCALAPPDATA%/serial-hid-kvm/targets.json`; only endpoints read |
+| `SHKVM_CAPTURE_LOG_DIR` | Platform capture cache; empty disables |
+| `SHKVM_EVIDENCE_DIR` | `~/Documents/kvm-evidence` on Windows, `~/kvm-evidence` elsewhere; empty disables |
+| `SHKVM_HIDDEN_TOOLS` | Comma-separated override; `none` exposes all retained tools |
+| `SHKVM_RUNTIME_CONFIG` | Runtime JSON; falls back to `MCP_SERIAL_HID_KVM_RUNTIME_CONFIG`, then platform user directory |
+| `SHKVM_RT_<KEY>` | Runtime overrides, e.g. `WAIT_POLL_MS`, `SCREEN_STABLE_FRAMES`, `SCREEN_STABLE_THRESHOLD` |
+
+Runtime layers: defaults → file → environment → `configure`. Removed keys in
+existing JSON are ignored with warnings; remove them from your file. `get_timing`
+lists supported keys. Hardware/layout settings belong to `serial-hid-kvm`.
+
+Run independent hardware servers for two Targets (e.g. ports 9329 and 9331).
+Successful `select_target` resets baseline, regions, stability history, screen
+size, cursor and shell hints. Suspended waits return `context_changed`; restart
+after capturing the intended Target. Failed candidate ping keeps the current
+client and all state. The input lock persists across switches and allows capture,
+all state tools, health and evidence. One MCP process has one active Target;
+separate processes provide independent contexts.
+
+## Migration / breaking changes
+
+Removed from registration **and dispatch**, including hidden calls:
+`get_screen_text`, `get_screen_text_compact`, `detect_text_elements`, `click_text`,
+`wait_for_text`, `get_terminal_output`, `execute_and_read`, `run_powershell_and_read`,
+`run_wsl_and_read`, `run_powershell_until_done`, `run_task_and_report`.
+Use capture + Vision interpretation and explicit HID.
+
+Health no longer returns a text-engine status field. Language/terminal settings
+and the old PIL diff tuning key were removed. Old change aliases keep their
+names but now use filtered OpenCV scores; thresholds may need retuning. Unicode
+and shell verification semantics changed as described above.
+
+Restart the MCP client process to load the new registry. Hardware server processes
+can remain running. No Web UI, HTTP or HTTPS architecture changes are included.
+
+## Tests and direct scripts
+
+```bash
+python -m pytest tests
+```
+
+Tests use synthetic images, mocked clients and virtual clocks without hardware.
+[examples](examples/) retain direct TCP scripts. Their standalone PowerShell
+watcher uses an optional compressed-size heuristic independent of the canonical
+MCP engine; use MCP state tools for actual pixel analysis.
 
 ## License
 

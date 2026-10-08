@@ -6,7 +6,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [{name = "sunasaji"}]
-keywords = ["mcp", "mcp-server", "kvm", "ai-agent", "claude", "ocr"]
+keywords = ["mcp", "mcp-server", "kvm", "ai-agent", "claude", "opencv"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",
@@ -17,7 +17,8 @@ dependencies = [
     "serial-hid-kvm",
     "mcp>=1.0.0",
     "pillow>=10.0.0",
-    "pytesseract>=0.3.10",
+    "numpy>=1.24.0",
+    "opencv-python>=4.8.0",
 ]
 
 [project.urls]

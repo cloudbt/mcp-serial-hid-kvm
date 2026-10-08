@@ -12,14 +12,20 @@ import mcp_serial_hid_kvm.server as srv
 
 class MultiTargetTests(unittest.TestCase):
     def setUp(self):
-        keys = ("_client", "_current_target", "_baseline", "_screen_size",
+        keys = ("_client", "_current_target", "_state", "_screen_size",
                 "_cursor_pos", "_focused_shell_hint", "_input_lock")
         saved = {key: getattr(srv, key) for key in keys}
         self.addCleanup(lambda: [setattr(srv, key, value) for key, value in saved.items()])
         self.old_client = Mock()
         srv._client = self.old_client
         srv._current_target = {"name": "target1", "host": "127.0.0.1", "port": 9329}
-        srv._baseline = "target1-baseline"
+        srv._state = srv.StateEngine()
+        from PIL import Image
+        srv._state.set_baseline(Image.new("RGB", (1920, 1080)))
+        srv._state.stable_count = 3
+        srv._state.last_regions = [{"x": 10}]
+        self.old_baseline = srv._state.baseline
+        self.old_generation = srv._state.generation
         srv._screen_size = (1920, 1080)
         srv._cursor_pos = (10, 20)
         srv._focused_shell_hint = "powershell"
@@ -39,7 +45,10 @@ class MultiTargetTests(unittest.TestCase):
         self.assertEqual(result["current"]["name"], "target1")
         self.assertIs(srv._client, self.old_client)
         self.old_client.close.assert_not_called()
-        self.assertEqual(srv._baseline, "target1-baseline")
+        self.assertIs(srv._state.baseline, self.old_baseline)
+        self.assertEqual(srv._state.generation, self.old_generation)
+        self.assertEqual(srv._state.stable_count, 3)
+        self.assertEqual(srv._state.last_regions, [{"x": 10}])
         self.assertEqual(srv._screen_size, (1920, 1080))
         candidate.close.assert_called_once()
 
@@ -55,7 +64,11 @@ class MultiTargetTests(unittest.TestCase):
         self.assertEqual(order, ["ping", "close", "timing"])
         self.assertIs(srv._client, candidate)
         self.assertEqual(srv._current_target["port"], 9331)
-        for key in ("_baseline", "_screen_size", "_cursor_pos", "_focused_shell_hint"):
+        self.assertIsNone(srv._state.baseline)
+        self.assertEqual(srv._state.stable_count, 0)
+        self.assertEqual(srv._state.last_regions, [])
+        self.assertGreater(srv._state.generation, self.old_generation)
+        for key in ("_screen_size", "_cursor_pos", "_focused_shell_hint"):
             self.assertIsNone(getattr(srv, key))
         self.assertEqual(srv._input_lock["reason"], "read-only test")
 

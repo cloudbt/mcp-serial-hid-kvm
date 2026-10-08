@@ -1,66 +1,14 @@
 """Deterministic unit tests for the Route A wrapper-tool helpers.
 
-These cover the pure logic (text bounding, image diff, WSL command shaping)
-and structured OCR, without requiring KVM hardware or a running API server.
+These cover configuration, Unicode transfer and input locks without hardware.
 """
 
 import os
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 import mcp_serial_hid_kvm.server as srv
-from mcp_serial_hid_kvm.ocr import TerminalOCR
 from mcp_serial_hid_kvm.runtime_config import DEFAULTS, RuntimeConfig
-
-
-def test_normalize_lines_collapses_blanks_and_trims_edges():
-    out = srv._normalize_lines("\n\n  a  \n\n\n b \n\n")
-    assert out == ["  a", "", " b"]
-
-
-def test_compact_text_head():
-    out, count, truncated = srv._compact_text("l1\nl2\nl3\nl4", max_lines=2, max_chars=1000)
-    assert out == "l1\nl2"
-    assert count == 2
-    assert truncated is True
-
-
-def test_compact_text_tail():
-    out, _count, truncated = srv._compact_text(
-        "l1\nl2\nl3\nl4", max_lines=2, max_chars=1000, tail=True
-    )
-    assert out == "l3\nl4"
-    assert truncated is True
-
-
-def test_compact_text_char_limit():
-    out, _count, truncated = srv._compact_text("abcdefgh", max_lines=0, max_chars=4)
-    assert out == "abcd"
-    assert truncated is True
-
-
-def test_compact_text_no_truncation():
-    out, count, truncated = srv._compact_text("a\nb", max_lines=10, max_chars=100)
-    assert out == "a\nb"
-    assert count == 2
-    assert truncated is False
-
-
-def test_diff_score_identical_is_zero():
-    img = Image.new("L", (50, 50), 0)
-    assert srv._diff_score(img, img.copy()) == 0.0
-
-
-def test_diff_score_opposite_is_one():
-    black = Image.new("L", (50, 50), 0)
-    white = Image.new("L", (50, 50), 255)
-    assert srv._diff_score(black, white) == 1.0
-
-
-def test_diff_score_resizes_mismatched():
-    a = Image.new("L", (40, 40), 0)
-    b = Image.new("L", (80, 80), 0)
-    assert srv._diff_score(a, b) == 0.0
 
 
 def test_crop_region_clamps_bounds():
@@ -72,82 +20,6 @@ def test_crop_region_clamps_bounds():
 def test_crop_region_none_returns_same():
     img = Image.new("RGB", (100, 100), "white")
     assert srv._crop_region(img, None) is img
-
-
-def test_build_wsl_command_basic():
-    line = srv._build_wsl_command("uname -a", "Ubuntu-24.04")
-    assert line == 'wsl.exe -d Ubuntu-24.04 -- bash -lc "uname -a"'
-
-
-def test_build_wsl_command_escapes_double_quotes():
-    line = srv._build_wsl_command('echo "hi"', "Ubuntu-24.04")
-    assert line == 'wsl.exe -d Ubuntu-24.04 -- bash -lc "echo `"hi`""'
-
-
-def test_ocr_failed_detects_sentinel():
-    assert srv._ocr_failed("[OCR Error: boom]") is True
-    assert srv._ocr_failed("normal text") is False
-
-
-def test_compact_ocr_error_is_bounded_and_clean():
-    huge = "[OCR Error: " + ("x " * 500) + "]"
-    payload = srv._compact_ocr_error(huge, limit=50)
-    assert payload["ok"] is False
-    assert payload["error"] == "ocr_failed"
-    assert len(payload["detail"]) <= 53  # 50 + "..."
-    assert "\n" not in payload["detail"]
-
-
-def test_extract_elements_returns_boxes():
-    img = Image.new("RGB", (640, 200), "white")
-    draw = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("arial.ttf", 48)
-    except Exception:
-        font = ImageFont.load_default()
-    draw.text((40, 60), "OK CANCEL", fill="black", font=font)
-
-    elements = TerminalOCR().extract_elements(img, min_confidence=0.0)
-    texts = [e["text"] for e in elements]
-    assert "OK" in texts
-    for e in elements:
-        assert set(("text", "x", "y", "w", "h", "confidence")) <= set(e)
-        assert 0.0 <= e["confidence"] <= 1.0
-        # coordinates mapped back into the original frame
-        assert 0 <= e["x"] <= img.width
-        assert 0 <= e["y"] <= img.height
-
-
-# --- V2: text matching -----------------------------------------------------
-
-def test_match_text_contains_is_case_insensitive():
-    assert srv._match_text("Hello World", "world", "contains") == (True, 1)
-
-
-def test_match_text_contains_counts_occurrences():
-    assert srv._match_text("a a a", "a", "contains") == (True, 3)
-
-
-def test_match_text_exact_matches_whole_line():
-    assert srv._match_text("foo\nbar\nfoo", "foo", "exact") == (True, 2)
-    assert srv._match_text("foobar", "foo", "exact") == (False, 0)
-
-
-def test_match_text_regex():
-    assert srv._match_text("err 2026 ok", r"\d{4}", "regex") == (True, 1)
-
-
-def test_match_text_bad_regex_is_safe():
-    assert srv._match_text("anything", "(", "regex") == (False, 0)
-
-
-def test_match_text_empty_needle():
-    assert srv._match_text("anything", "", "contains") == (False, 0)
-
-
-def test_brief_result_summarizes():
-    assert srv._brief_result("wait_for_text", {"found": True}) == "found=True"
-    assert srv._brief_result("x", {"error": "ocr_failed"}) == "ERROR ocr_failed"
 
 
 # --- V2: cursor tracking ---------------------------------------------------
@@ -254,84 +126,12 @@ def test_runtime_config_env_override(tmp_path):
         del os.environ["SHKVM_RT_WAIT_POLL_MS"]
 
 
-# --- V2.1: changed-pixel-fraction diff metric ------------------------------
-
-def test_diff_score_fraction_identical_zero():
-    img = Image.new("L", (50, 50), 0)
-    assert srv._diff_score(img, img.copy()) == 0.0
-
-
-def test_diff_score_fraction_full_change_one():
-    assert srv._diff_score(Image.new("L", (50, 50), 0),
-                           Image.new("L", (50, 50), 255)) == 1.0
-
-
-def test_diff_score_respects_pixel_delta():
-    a = Image.new("L", (50, 50), 100)
-    b = Image.new("L", (50, 50), 110)  # uniform delta of 10
-    assert srv._diff_score(a, b, pixel_delta=30) == 0.0   # 10 < 30 -> no change
-    assert srv._diff_score(a, b, pixel_delta=5) == 1.0    # 10 > 5  -> all changed
-
-
-def test_diff_score_sparse_text_is_small_but_nonzero():
-    a = Image.new("L", (100, 100), 0)
-    b = a.copy()
-    for x in range(10):
-        for y in range(10):
-            b.putpixel((x, y), 255)  # 100 of 10000 px = 1%
-    score = srv._diff_score(a, b, pixel_delta=30)
-    assert 0.005 < score < 0.02
-
-
-# --- V2.1: config region/bool coercion -------------------------------------
-
-def test_config_region_accepts_null_and_quad(tmp_path):
-    cfg = _fresh_config(tmp_path)
-    cfg.update({"terminal_region": [0, 500, 1920, 580]})
-    assert cfg.get("terminal_region") == [0, 500, 1920, 580]
-    cfg.update({"terminal_region": None})
-    assert cfg.get("terminal_region") is None
-
-
-def test_config_region_rejects_bad_shape(tmp_path):
-    cfg = _fresh_config(tmp_path)
-    raised = False
-    try:
-        cfg.update({"terminal_region": [1, 2, 3]})
-    except ValueError:
-        raised = True
-    assert raised
-
-
 def test_config_bool_coercion(tmp_path):
     cfg = _fresh_config(tmp_path)
     cfg.update({"clear_input_before_command": "false"})
     assert cfg.get("clear_input_before_command") is False
     cfg.update({"clear_input_before_command": True})
     assert cfg.get("clear_input_before_command") is True
-
-
-def test_config_ocr_lang_keys(tmp_path):
-    cfg = _fresh_config(tmp_path)
-    assert cfg.get("ocr_lang") == "eng+jpn"
-    assert cfg.get("ocr_fast_lang") == "eng"
-    cfg.update({"ocr_fast_lang": "eng+jpn"})
-    assert cfg.get("ocr_fast_lang") == "eng+jpn"
-
-
-# --- V2.1: OCR lang override plumbing --------------------------------------
-
-def test_extract_text_accepts_lang_override():
-    img = Image.new("RGB", (400, 120), "white")
-    draw = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("arial.ttf", 40)
-    except Exception:
-        font = ImageFont.load_default()
-    draw.text((20, 30), "hello", fill="black", font=font)
-    # explicit eng override must not raise and should read ASCII text
-    txt = TerminalOCR().extract_text(img, lang="eng")
-    assert "hello" in txt.lower()
 
 
 # --- paste_unicode_text helpers --------------------------------------------
@@ -403,27 +203,6 @@ def test_sanitize_label_empty_inputs():
     assert srv._sanitize_label("///") == ""
 
 
-# --- ops tools: done-marker wrapping ----------------------------------------
-
-def test_new_done_marker_uses_safe_alphabet():
-    for _ in range(20):
-        marker = srv._new_done_marker()
-        assert marker.startswith("KVMDONE_")
-        suffix = marker[len("KVMDONE_"):]
-        assert len(suffix) == 4
-        assert all(c in srv._MARKER_ALPHABET for c in suffix)
-
-
-def test_wrap_command_with_marker_hides_marker_from_echo():
-    marker = "KVMDONE_ACDE"
-    wrapped = srv._wrap_command_with_marker("terraform plan", marker)
-    # The typed line must NOT contain the assembled marker (would false-match
-    # on the command echo), but must produce it when PowerShell evaluates it.
-    assert marker not in wrapped
-    assert wrapped.startswith("terraform plan; ")
-    assert "Write-Output ('KV'+'MDONE_ACDE')" in wrapped
-
-
 # --- ops tools: transfer_unicode_file command building -----------------------
 
 def test_transfer_commands_are_pure_ascii():
@@ -487,7 +266,7 @@ def test_input_lock_blocks_input_tools_only():
         assert err["error"] == "input_locked"
         assert err["reason"] == "observing PRD F56"
         # Read-only tools stay available.
-        assert srv._check_input_lock("get_screen_text_compact", {}) is None
+        assert srv._check_input_lock("get_changed_regions", {}) is None
         assert srv._check_input_lock("health", {}) is None
         assert srv._check_input_lock("save_evidence", {}) is None
     finally:
@@ -498,8 +277,8 @@ def test_input_lock_allows_dry_run_variants():
     _reset_lock()
     try:
         srv._do_set_input_lock(locked=True)
-        assert srv._check_input_lock("click_text", {"dry_run": True}) is None
-        assert srv._check_input_lock("click_text", {}) is not None
+        assert srv._check_input_lock("paste_unicode_text", {"dry_run": True}) is None
+        assert srv._check_input_lock("paste_unicode_text", {}) is not None
         assert srv._check_input_lock("transfer_unicode_file", {"dry_run": True}) is None
     finally:
         _reset_lock()
@@ -523,9 +302,7 @@ def test_input_tools_cover_all_hid_generating_tools():
     expected = {
         "type_text", "send_key", "send_key_sequence",
         "mouse_move", "mouse_click", "mouse_drag", "mouse_scroll",
-        "execute_and_read", "run_powershell_and_read", "run_wsl_and_read",
-        "run_powershell_until_done", "open_shell", "click_text",
-        "run_task_and_report", "paste_unicode_text", "transfer_unicode_file",
+        "open_shell", "paste_unicode_text", "transfer_unicode_file",
     }
     assert srv.INPUT_TOOLS == expected
 
@@ -590,8 +367,8 @@ def test_list_tools_filters_hidden_but_keeps_them_callable():
         names = {t.name for t in asyncio.run(srv.list_tools())}
         assert names.isdisjoint(DEFAULT_HIDDEN_TOOLS)
         # replacements are exposed
-        assert {"run_powershell_and_read", "get_screen_text_compact",
-                "wait_for_screen_change", "type_text", "send_key"} <= names
+        assert {"wait_for_change", "get_changed_regions",
+                "wait_for_stable", "type_text", "send_key"} <= names
         # hidden tools are still dispatchable (hidden != disabled): the
         # dispatcher must not answer "Unknown tool" for them.
         config.hidden_tools = set()

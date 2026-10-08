@@ -32,20 +32,8 @@ logger = logging.getLogger(__name__)
 #   *_lines / *_chars / *_radius -> count (int)
 DEFAULTS: dict = {
     "default_wsl_distro": "Ubuntu-24.04",
-    # OCR language for content tools (get_screen_text, get_screen_text_compact,
-    # detect_text_elements, click_text). Keep CJK here.
-    "ocr_lang": "eng+jpn",
-    # OCR language for command/poll tools (run_*_and_read, execute_and_read,
-    # wait_for_text, get_terminal_output). ASCII output -> eng is fast + clean.
-    "ocr_fast_lang": "eng",
-    # Optional default [x, y, w, h] region for get_terminal_output. null = full
-    # screen (tail). Set a bottom-screen region to read only the prompt area.
-    "terminal_region": None,
-    # screen_changed/wait_for_screen_change: a pixel counts as "changed" when
-    # its grayscale delta exceeds this (0-255); score = fraction of such pixels.
-    "screen_diff_pixel_delta": 30,
     # Clear the target input line (PSReadLine Esc/RevertLine) before typing a
-    # command, so back-to-back run_* calls do not concatenate onto leftover text.
+    # Unicode payload command, so consecutive transfers do not concatenate.
     "clear_input_before_command": True,
     "click_hold_ms": 50,
     "click_after_ms": 100,
@@ -54,13 +42,12 @@ DEFAULTS: dict = {
     "type_key_ms": 20,
     "type_inter_key_ms": 20,
     "type_shift_ms": 10,
-    "terminal_wait_seconds": 2.0,
     "wait_timeout_seconds": 30.0,
-    "wait_poll_ms": 500,
+    "wait_poll_ms": 200,
     "screen_change_threshold": 0.02,
+    "screen_stable_threshold": 0.001,
+    "screen_stable_frames": 4,
     "cursor_crop_radius": 150,
-    "terminal_max_lines": 30,
-    "terminal_max_chars": 3000,
     "open_shell_wait_seconds": 2.0,
     "max_wait_seconds": 60.0,
 }
@@ -70,10 +57,6 @@ _INT = int
 _FLOAT = float
 _SPECS: dict = {
     "default_wsl_distro": (str, None, None),
-    "ocr_lang": (str, None, None),
-    "ocr_fast_lang": (str, None, None),
-    "terminal_region": ("region", None, None),
-    "screen_diff_pixel_delta": (_INT, 0, 255),
     "clear_input_before_command": (bool, None, None),
     "click_hold_ms": (_INT, 0, 10000),
     "click_after_ms": (_INT, 0, 10000),
@@ -82,13 +65,12 @@ _SPECS: dict = {
     "type_key_ms": (_INT, 0, 10000),
     "type_inter_key_ms": (_INT, 0, 10000),
     "type_shift_ms": (_INT, 0, 10000),
-    "terminal_wait_seconds": (_FLOAT, 0.0, 600.0),
     "wait_timeout_seconds": (_FLOAT, 0.0, 600.0),
     "wait_poll_ms": (_INT, 10, 60000),
     "screen_change_threshold": (_FLOAT, 0.0, 1.0),
+    "screen_stable_threshold": (_FLOAT, 0.0, 1.0),
+    "screen_stable_frames": (_INT, 1, 1000),
     "cursor_crop_radius": (_INT, 1, 4096),
-    "terminal_max_lines": (_INT, 1, 1000),
-    "terminal_max_chars": (_INT, 1, 200000),
     "open_shell_wait_seconds": (_FLOAT, 0.0, 600.0),
     "max_wait_seconds": (_FLOAT, 1.0, 600.0),
 }
@@ -126,13 +108,6 @@ def _coerce(key: str, value):
     if key not in _SPECS:
         raise ValueError(f"unknown config key: {key}")
     typ, lo, hi = _SPECS[key]
-    if typ == "region":
-        if value is None:
-            return None
-        if (isinstance(value, (list, tuple)) and len(value) == 4
-                and all(isinstance(v, (int, float)) for v in value)):
-            return [int(v) for v in value]
-        raise ValueError(f"{key} must be null or [x, y, w, h]")
     if typ is bool:
         if isinstance(value, bool):
             return value

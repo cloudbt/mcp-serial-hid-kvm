@@ -90,9 +90,8 @@ def parse_targets(raw: str | None, default_host: str, default_port: int) -> dict
 # setup-time device management. Calls to them still work (hidden != disabled);
 # override with SHKVM_HIDDEN_TOOLS (comma-separated, or "none" to show all).
 DEFAULT_HIDDEN_TOOLS = frozenset({
-    "execute_and_read",        # superseded by run_powershell_and_read
-    "get_screen_text",         # superseded by get_screen_text_compact
-    "screen_changed",          # superseded by wait_for_screen_change
+    "screen_changed",          # deprecated alias of get_changed_regions
+    "wait_for_screen_change",  # deprecated alias of wait_for_change
     "send_key_sequence",       # covered by type_text {tags} + send_key
     "list_capture_devices",    # setup-time: use examples/ scripts instead
     "set_capture_device",
@@ -122,9 +121,6 @@ class Config:
         if raw_targets is None:
             raw_targets = targets_file_json()
         self.targets: dict = parse_targets(raw_targets, self.kvm_host, self.kvm_port)
-
-        # Local OCR
-        self.tesseract_cmd: str | None = os.environ.get("SHKVM_OCR_CMD")
 
         # Capture log directory
         raw = os.environ.get("SHKVM_CAPTURE_LOG_DIR")
