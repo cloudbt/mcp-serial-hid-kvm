@@ -1,5 +1,11 @@
 # mcp-serial-hid-kvm
 
+Windows saved files can also be copied from Target to Host over the existing
+HID/HDMI channels, with asynchronous jobs, verified chunks and whole-file SHA-256.
+See [file copy workflow and limits](docs/file-copy.md) for the four tools, required
+focus observations, cancellation/recovery and cleanup. This copies raw bytes;
+exporting an application's unsaved state is a separate application workflow.
+
 MCP server for keyboard, mouse, capture and image-state detection on physical
 Target PCs. Hardware operations delegate to [serial-hid-kvm](https://github.com/cloudbt/serial-hid-kvm) over JSON Lines TCP.
 

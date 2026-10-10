@@ -27,6 +27,7 @@ from .config import config
 from .vision import StateEngine
 from .vision.tools import state_tools
 from .runtime_config import RuntimeConfig
+from .file_copy import CopyManager, file_copy_tools
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -56,6 +57,8 @@ _current_target: dict = {"name": "default",
 # refused — for observing production screens (e.g. PRD/F56) without any risk
 # of stray keystrokes. In-memory only: an MCP server restart clears it.
 _input_lock: dict | None = None
+_copies = CopyManager()
+_copies.interlocked = lambda: _input_lock is not None
 
 
 def get_config() -> RuntimeConfig:
@@ -534,6 +537,18 @@ _UNLOCK_CONFIRM = "UNLOCK"
 
 def _check_input_lock(name: str, arguments: dict) -> dict | None:
     """Return a refusal payload if *name* is an input tool and the lock is set."""
+    dry = name in ("paste_unicode_text", "transfer_unicode_file") and arguments.get("dry_run")
+    if _input_lock is not None and name in INPUT_TOOLS and not dry:
+        return {"ok": False, "error": "input_locked", "reason": _input_lock.get("reason"),
+                "since": _input_lock.get("since"), "detail": "Input interlock is enabled."}
+    busy = _copies.busy(_current_target) if name in INPUT_TOOLS | {"select_target", "set_capture_device", "set_capture_resolution", "configure"} else None
+    if busy:
+        if name in ("paste_unicode_text", "transfer_unicode_file") and arguments.get("dry_run"):
+            return None
+        return {"ok": False, "error": "file_copy_owns_input", "job_id": busy,
+                "detail": "Cancel, observe helper cleanup, then release the copy job."}
+    if name == "advance_file_copy" and _input_lock is not None:
+        return {"ok": False, "error": "input_locked"}
     if _input_lock is None or name not in INPUT_TOOLS:
         return None
     # dry_run variants produce no HID input.
@@ -1393,6 +1408,7 @@ async def _all_tools() -> list[Tool]:
         ),
     ]
     tools.extend(state_tools())
+    tools.extend(file_copy_tools())
     return tools
 
 
@@ -1421,6 +1437,17 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
         elif name == "list_targets":
             result = _do_list_targets()
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        elif name == "get_file_copy_status":
+            return [TextContent(type="text", text=json.dumps(_copies.status(arguments["job_id"]), ensure_ascii=False))]
+        elif name == "cancel_file_copy":
+            return [TextContent(type="text", text=json.dumps(_copies.cancel(arguments["job_id"]), ensure_ascii=False))]
+        elif name == "copy_file_from_target":
+            result = _copies.prepare(get_client(), _current_target, **arguments)
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+        elif name == "advance_file_copy":
+            result = _copies.advance(get_client(), _current_target, **arguments)
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
         elif name == "select_target":
@@ -1504,6 +1531,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
         elif name == "capture_screen":
             image = _capture_image()
+            _copies.observe({"host": _current_target["host"], "port": int(_current_target["port"])})
             _state.set_baseline(image)
             _save_capture_log(image, "capture")
             # Use JPEG to keep size under 20MB (base64 limit)
