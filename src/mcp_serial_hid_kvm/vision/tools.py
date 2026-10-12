@@ -40,7 +40,4 @@ def state_tools():
         tool("wait_for_change", "Wait for filtered image changes against a fixed pre-action baseline. Default threshold 0.02. No text or UI interpretation.", change),
         tool("wait_for_stable", "Wait for N consecutive frame differences at or below threshold (default 0.001, N=4). Needs N+1 captures; stability does not verify UI or command success.",
              {**wait, "stable_frames": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 4}}),
-        tool("screen_changed", "DEPRECATED compatibility alias of get_changed_regions; uses the same OpenCV engine.",
-             {**common, "auto_baseline": {"type": "boolean", "default": False}}),
-        tool("wait_for_screen_change", "DEPRECATED compatibility alias of wait_for_change; uses the same OpenCV engine.", change),
     ]

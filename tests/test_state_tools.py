@@ -1,6 +1,7 @@
 """MCP integration boundaries with mocked captures and TCP clients."""
 
 import asyncio
+import io
 import json
 import subprocess
 import sys
@@ -17,12 +18,17 @@ REMOVED = {
     "get_screen_text", "get_screen_text_compact", "detect_text_elements", "click_text",
     "wait_for_text", "get_terminal_output", "run_powershell_and_read", "run_wsl_and_read",
     "execute_and_read", "run_powershell_until_done", "run_task_and_report",
+    # Removed in #4: deprecated aliases and the send_key_sequence duplicate.
+    "screen_changed", "wait_for_screen_change", "send_key_sequence",
 }
 
 
 @pytest.fixture
 def context(monkeypatch, tmp_path):
     client = Mock()
+    frame = io.BytesIO()
+    Image.new("RGB", (640, 480)).save(frame, format="JPEG")
+    client.capture_frame_jpeg.return_value = (frame.getvalue(), 640, 480)
     monkeypatch.setattr(srv, "_client", client)
     monkeypatch.setattr(srv, "_state", StateEngine())
     monkeypatch.setattr(srv, "_input_lock", None)
@@ -79,14 +85,9 @@ def test_stable_tool_actual_success_under_lock(context):
     assert result["stable"] and result["attempts"] == 3
 
 
-def test_compatibility_aliases_use_same_engine(context):
-    call("set_screen_baseline")
-    assert call("screen_changed") == call("get_changed_regions")
-    old = call("wait_for_screen_change", timeout_seconds=0)
-    new = call("wait_for_change", timeout_seconds=0)
-    old.pop("elapsed_ms")
-    new.pop("elapsed_ms")
-    assert old == new
+def test_hidden_state_tools_stay_callable(context):
+    assert call("set_screen_baseline")["ok"]
+    assert call("get_changed_regions")["changed"] is False
 
 
 def test_successful_select_target_aborts_wait_without_comparing_new_target(context, monkeypatch):
