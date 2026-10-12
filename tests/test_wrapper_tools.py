@@ -300,7 +300,7 @@ def test_input_unlock_requires_confirm():
 
 def test_input_tools_cover_all_hid_generating_tools():
     expected = {
-        "type_text", "send_key", "send_key_sequence",
+        "type_text", "send_key",
         "mouse_move", "mouse_click", "mouse_drag", "mouse_scroll",
         "open_shell", "paste_unicode_text", "transfer_unicode_file",
     }
@@ -367,8 +367,8 @@ def test_list_tools_filters_hidden_but_keeps_them_callable():
         names = {t.name for t in asyncio.run(srv.list_tools())}
         assert names.isdisjoint(DEFAULT_HIDDEN_TOOLS)
         # replacements are exposed
-        assert {"wait_for_change", "get_changed_regions",
-                "wait_for_stable", "type_text", "send_key"} <= names
+        assert {"wait_for_change", "wait_for_stable", "capture_screen",
+                "get_timing", "type_text", "send_key"} <= names
         # hidden tools are still dispatchable (hidden != disabled): the
         # dispatcher must not answer "Unknown tool" for them.
         config.hidden_tools = set()

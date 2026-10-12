@@ -101,28 +101,28 @@ The calling model must inspect the final capture.
 
 ## Available tools
 
-29 tools are callable; 23 are advertised by default. Six tools marked hidden
-are setup tools or compatibility aliases. `SHKVM_HIDDEN_TOOLS=none` advertises
-all retained tools; removed tools cannot be exposed or invoked.
+30 tools are callable; 24 are advertised by default (23 when only one Target
+endpoint is configured). Tools marked hidden are setup or rarely used tuning/state
+tools; hidden tools remain callable. `select_target` is hidden by default only when
+the configured targets resolve to a single endpoint. `SHKVM_HIDDEN_TOOLS` replaces
+the default list (`none` advertises all retained tools); removed tools cannot be
+exposed or invoked.
 
 | Tool | Purpose |
 |---|---|
-| `type_text` | ASCII HID, inline tags, optional raw mode; actual newlines press Enter |
+| `type_text` | ASCII HID, inline tags, optional raw mode; actual newlines press Enter; `ime_off=true` sends HID `0x91` first |
 | `send_key` | One HID key with optional modifiers |
-| `send_key_sequence` *(hidden)* | Multiple HID steps with delays |
 | `mouse_move` | Absolute/relative HID cursor movement |
-| `mouse_click` | Optional coordinate and button |
-| `mouse_drag` | Press, move, release |
-| `mouse_scroll` | Wheel movement |
-| `capture_screen` | JPEG image and full-frame baseline |
-| `set_screen_baseline` | Full capture and optional default ROI; compact metadata |
+| `mouse_click` | Optional coordinate and button; `count` 1–3 for double/triple click |
+| `mouse_drag` | Press, move, release; optional `steps` for intermediate moves (default 1) |
+| `mouse_scroll` | Wheel movement; optional `x`,`y` moves there first |
+| `capture_screen` | JPEG image + metadata text; optional `region`/`zoom`/`max_width`/`grid`; full-frame baseline |
+| `set_screen_baseline` *(hidden)* | Full capture and optional default ROI; compact metadata |
 | `wait_for_change` | Wait against baseline; `{changed,score,elapsed_ms,attempts,regions}` |
 | `wait_for_stable` | N consecutive low-change comparisons; `{stable,score,elapsed_ms,attempts,stable_frames}` |
-| `get_changed_regions` | Filtered `{x,y,w,h,area_ratio}` boxes and score |
-| `screen_changed` *(hidden, deprecated)* | Alias of `get_changed_regions`, same OpenCV engine |
-| `wait_for_screen_change` *(hidden, deprecated)* | Alias of `wait_for_change`, same OpenCV engine |
+| `get_changed_regions` *(hidden)* | Filtered `{x,y,w,h,area_ratio}` boxes and score |
 | `cursor_crop` | Image crop around explicit or tracked capture coordinates |
-| `health` | `{ok,api,serial,video,capture_device,resolution,target,input_locked,errors}` |
+| `health` | `{ok,api,serial,video,capture_device,resolution,target,input_locked,errors}` plus identity `{api_host,api_port,serial_port,serial_vid_pid,hid_size,capture_size,targets}` |
 | `get_device_info` | Serial/capture/HID configuration |
 | `list_capture_devices` *(hidden)* | Capture-device inventory |
 | `set_capture_device` *(hidden)* | Select device; invalidate image state on success |
@@ -132,10 +132,24 @@ all retained tools; removed tools cannot be exposed or invoked.
 | `transfer_unicode_file` | Chunked Base64URL → Target UTF-8 file; dry-run sizes and expected hash prefix |
 | `save_evidence` | Save capture/ROI to Host evidence directory |
 | `list_targets` | Configured endpoints and active Target |
-| `select_target` | Ping before switching; keep old connection if unreachable |
+| `select_target` *(hidden with one endpoint)* | Ping before switching; keep old connection if unreachable |
 | `set_input_lock` | Refuse HID tools; unlock requires `confirm="UNLOCK"` |
-| `configure` | Runtime defaults/HID timing, optional persistence |
+| `configure` *(hidden)* | Runtime defaults/HID timing, optional persistence |
 | `get_timing` | Effective defaults and source metadata |
+
+### capture_screen options
+
+Without options the KVM's JPEG is returned unchanged (no second compression).
+`region` `[x,y,w,h]` in capture pixels is clamped to the frame; `zoom` (1–4)
+enlarges the region; `max_width` only shrinks; `grid=true` overlays lines labelled
+in **HID coordinates**, so a label can be passed to `mouse_click` directly. The
+baseline is always the full frame. A short JSON text follows the image:
+
+```json
+{"capture": "1920x1080", "hid": "1920x1080", "image": "600x300",
+ "region": [100, 200, 300, 150], "scale": 2,
+ "to_hid": "hid_x = 100 + image_x * 0.5; hid_y = 200 + image_y * 0.5"}
+```
 
 ### Image-state parameters
 
@@ -209,9 +223,14 @@ Removed from registration **and dispatch**, including hidden calls:
 Use capture + Vision interpretation and explicit HID.
 
 Health no longer returns a text-engine status field. Language/terminal settings
-and the old PIL diff tuning key were removed. Old change aliases keep their
-names but now use filtered OpenCV scores; thresholds may need retuning. Unicode
-and shell verification semantics changed as described above.
+and the old PIL diff tuning key were removed. Unicode and shell verification
+semantics changed as described above.
+
+Also removed: the deprecated aliases `screen_changed` (use `get_changed_regions`)
+and `wait_for_screen_change` (use `wait_for_change`), and `send_key_sequence`
+(use `type_text` tags such as `{tab}{enter}` plus `send_key`). `configure`,
+`set_screen_baseline` and `get_changed_regions` are now hidden by default but
+still callable.
 
 Restart the MCP client process to load the new registry. Hardware server processes
 can remain running. No Web UI, HTTP or HTTPS architecture changes are included.

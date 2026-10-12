@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 from typing import Any
@@ -19,7 +20,7 @@ from typing import Any
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import ImageContent, TextContent, Tool
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from serial_hid_kvm.client import KvmClient, KvmClientError
 from serial_hid_kvm.hid_keycodes import validate_chars
 
@@ -138,10 +139,156 @@ def _save_capture_log(image: Image.Image, suffix: str = "") -> str | None:
         return None
 
 
+def _capture_frame(quality: int = 85) -> tuple[bytes, Image.Image]:
+    """Fetch a frame from KVM server: the original JPEG bytes and a PIL Image."""
+    jpeg_bytes, w, h = get_client().capture_frame_jpeg(quality)
+    return jpeg_bytes, Image.open(io.BytesIO(jpeg_bytes))
+
+
 def _capture_image(quality: int = 85) -> Image.Image:
     """Fetch a frame from KVM server and return as PIL Image."""
-    jpeg_bytes, w, h = get_client().capture_frame_jpeg(quality)
-    return Image.open(io.BytesIO(jpeg_bytes))
+    return _capture_frame(quality)[1]
+
+
+# capture_screen view options: zoom limit and "nice" grid steps (HID pixels).
+_ZOOM_MAX = 4
+_GRID_STEPS = (5, 10, 20, 25, 50, 100, 200, 250, 500, 1000)
+_GRID_MIN_SPACING = 80  # image pixels between grid lines
+
+
+def _num(value: float) -> float | int:
+    """Round metadata numbers; integral values print without a decimal point."""
+    value = round(value, 4)
+    return int(value) if value == int(value) else value
+
+
+def _grid_font():
+    try:
+        return ImageFont.load_default(size=14)
+    except (TypeError, OSError):  # Pillow without FreeType / old Pillow
+        return ImageFont.load_default()
+
+
+def _draw_grid(view: Image.Image, box: list, capture_size: tuple[int, int],
+               hid_size: tuple[int, int]) -> tuple[Image.Image, int]:
+    """Overlay a labelled grid on *view*; labels are HID coordinates."""
+    (cw, ch), (hw, hh) = capture_size, hid_size
+    sx, sy = view.width / box[2], view.height / box[3]  # image px per capture px
+    px_per_hid = min(sx * cw / hw, sy * ch / hh)
+    step = next((s for s in _GRID_STEPS if s * px_per_hid >= _GRID_MIN_SPACING),
+                _GRID_STEPS[-1])
+    overlay = Image.new("RGBA", view.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = _grid_font()
+
+    def label(x, y, text):
+        left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+        w, h = right - left + 4, bottom - top + 4
+        x, y = min(max(0, x), view.width - w), min(max(0, y), view.height - h)
+        draw.rectangle([x, y, x + w, y + h], fill=(0, 0, 0, 170))
+        draw.text((x + 2 - left, y + 2 - top), text, font=font, fill=(255, 255, 0, 255))
+
+    lines = []
+    for axis, start, length, cap, hid, scale in (
+            ("x", box[0], box[2], cw, hw, sx), ("y", box[1], box[3], ch, hh, sy)):
+        first = math.ceil(start * hid / cap / step) * step
+        last = math.floor((start + length) * hid / cap)
+        for v in range(first, last + 1, step):
+            lines.append((axis, v, round((v * cap / hid - start) * scale)))
+    for axis, v, pos in lines:
+        if axis == "x":
+            draw.line([(pos, 0), (pos, view.height)], fill=(255, 0, 255, 160))
+        else:
+            draw.line([(0, pos), (view.width, pos)], fill=(255, 0, 255, 160))
+    # Labels last so no line crosses them.
+    for axis, v, pos in lines:
+        if axis == "x":
+            label(pos + 2, 0, str(v))
+        else:
+            label(0, pos + 2, str(v))
+    view = Image.alpha_composite(view.convert("RGBA"), overlay).convert("RGB")
+    return view, step
+
+
+def _capture_view(image: Image.Image, hid_size: tuple[int, int], *, region=None,
+                  zoom=None, max_width=None, grid=False):
+    """Apply capture_screen's optional region/zoom/max_width/grid to a frame.
+
+    Returns ``(view, box, grid_step)``. view is None when no option changes the
+    frame, so the caller can return the KVM's JPEG without re-encoding. box is
+    the clamped [x, y, w, h] in capture pixels (the full frame without region).
+    """
+    cw, ch = image.size
+    box = [0, 0, cw, ch]
+    if region is not None:
+        if (not isinstance(region, (list, tuple)) or len(region) != 4
+                or any(type(v) is not int for v in region)):
+            raise ValueError("region must be [x, y, w, h] integers in capture pixels")
+        x, y, w, h = region
+        left, top = max(0, x), max(0, y)
+        right, bottom = min(cw, x + w), min(ch, y + h)
+        if right <= left or bottom <= top:
+            raise ValueError(f"region {list(region)} is outside the {cw}x{ch} capture")
+        box = [left, top, right - left, bottom - top]
+    zoom = 1 if zoom is None else zoom
+    if (isinstance(zoom, bool) or not isinstance(zoom, (int, float))
+            or not 1 <= zoom <= _ZOOM_MAX):
+        raise ValueError(f"zoom must be between 1 and {_ZOOM_MAX}")
+    if zoom != 1 and region is None:
+        raise ValueError("zoom requires region")
+    if max_width is not None and (type(max_width) is not int or max_width < 64):
+        raise ValueError("max_width must be an integer >= 64")
+
+    view = image
+    if box != [0, 0, cw, ch]:
+        view = view.crop((box[0], box[1], box[0] + box[2], box[1] + box[3]))
+    size = (max(1, round(box[2] * zoom)), max(1, round(box[3] * zoom)))
+    if max_width is not None and size[0] > max_width:
+        size = (max_width, max(1, round(size[1] * max_width / size[0])))
+    if size != view.size:
+        view = view.resize(size, Image.Resampling.LANCZOS)
+    step = None
+    if grid:
+        view, step = _draw_grid(view, box, (cw, ch), hid_size)
+    return (None if view is image else view), box, step
+
+
+def _capture_meta(capture_size: tuple[int, int], hid_size: tuple[int, int],
+                  box: list, image_size: tuple[int, int], grid_step=None) -> dict:
+    """Short capture_screen metadata: sizes, region, scale and image->HID mapping."""
+    (cw, ch), (hw, hh) = capture_size, hid_size
+    scale = image_size[0] / box[2]
+    kx = hw / cw * box[2] / image_size[0]
+    ky = hh / ch * box[3] / image_size[1]
+    ox, oy = box[0] * hw / cw, box[1] * hh / ch
+    meta = {
+        "capture": f"{cw}x{ch}", "hid": f"{hw}x{hh}",
+        "image": f"{image_size[0]}x{image_size[1]}", "region": box,
+        "scale": _num(scale),
+        "to_hid": (f"hid_x = {_num(ox)} + image_x * {_num(kx)}; "
+                   f"hid_y = {_num(oy)} + image_y * {_num(ky)}"),
+    }
+    if grid_step:
+        meta["grid_step_hid"] = grid_step
+    return meta
+
+
+def _encode_capture_jpeg(image: Image.Image) -> tuple[bytes, Image.Image]:
+    """JPEG-encode a capture under the 10 MB budget; returns (bytes, final image)."""
+    # Use JPEG to keep size under 20MB (base64 limit)
+    quality = 85
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=quality)
+    # If still too large, reduce quality then resize
+    while buffer.tell() > 10_000_000 and quality > 20:
+        quality -= 15
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=quality)
+    if buffer.tell() > 10_000_000:
+        image = image.resize((image.width // 2, image.height // 2))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=60)
+    return buffer.getvalue(), image
 
 
 def _get_screen_size() -> tuple[int, int]:
@@ -172,12 +319,29 @@ def _bump_cursor(dx: int, dy: int) -> None:
         _cursor_pos = (_cursor_pos[0] + int(dx), _cursor_pos[1] + int(dy))
 
 
+def _serial_vid_pid(info: dict) -> str | None:
+    """VID:PID (e.g. 1A86:55D3) of the active serial port from get_device_info."""
+    port = str(info.get("serial", {}).get("port") or "")
+    for p in info.get("ch340_ports") or []:
+        if not port or str(p.get("device", "")).upper() != port.upper():
+            continue
+        vid, pid = str(p.get("vid", "")), str(p.get("pid", ""))
+        if vid and pid:
+            return f"{int(vid, 16):04X}:{int(pid, 16):04X}"
+        m = re.search(r"VID:PID=([0-9A-F]{4}):([0-9A-F]{4})", str(p.get("hwid", "")), re.I)
+        if m:
+            return f"{m.group(1)}:{m.group(2)}".upper()
+    return None
+
+
 def _do_health(client: KvmClient) -> dict:
-    """Compact readiness snapshot for API / serial / video."""
+    """Compact readiness snapshot for API / serial / video plus device identity."""
+    global _screen_size
     errors: list[str] = []
     api_ok = serial_ok = video_ok = False
     capture_device = None
     resolution = None
+    serial_port = serial_vid_pid = hid_size = None
 
     try:
         client.ping()
@@ -192,6 +356,15 @@ def _do_health(client: KvmClient) -> dict:
             serial_ok = bool(serial.get("connected"))
             if not serial_ok and serial.get("error"):
                 errors.append(f"serial: {serial['error']}")
+            serial_port = serial.get("port")
+            try:
+                serial_vid_pid = _serial_vid_pid(info)
+            except ValueError:
+                pass
+            cfg = info.get("config", {})
+            if cfg.get("screen_width") and cfg.get("screen_height"):
+                _screen_size = (int(cfg["screen_width"]), int(cfg["screen_height"]))
+                hid_size = f"{_screen_size[0]}x{_screen_size[1]}"
             cap = info.get("capture", {})
             if cap and not cap.get("error"):
                 capture_device = (
@@ -223,7 +396,34 @@ def _do_health(client: KvmClient) -> dict:
         "target": _current_target["name"],
         "input_locked": _input_lock is not None,
         "errors": errors,
+        # Device identity, so a task can confirm its binding in one call.
+        "api_host": _current_target["host"],
+        "api_port": int(_current_target["port"]),
+        "serial_port": serial_port,
+        "serial_vid_pid": serial_vid_pid,
+        "hid_size": hid_size,
+        "capture_size": resolution,
+        "targets": {n: f"{s['host']}:{s['port']}" for n, s in config.targets.items()},
     }
+
+
+# Pause between the presses of a double/triple click. With the press hold
+# (click_hold_ms, capped at 100 ms) every click stays well inside the Windows
+# default double-click time of 500 ms.
+_MULTI_CLICK_GAP = 0.08
+
+
+async def _do_multi_click(client, button: str, x, y, count: int) -> None:
+    """Press/release *count* times with short fixed gaps (double/triple click)."""
+    cfg = get_config()
+    hold = min(cfg.get("click_hold_ms"), 100) / 1000
+    for i in range(count):
+        if i:
+            await asyncio.sleep(_MULTI_CLICK_GAP)
+        client.mouse_down(button, x, y)
+        await asyncio.sleep(hold)
+        client.mouse_up(button, x, y)
+    await asyncio.sleep(min(cfg.get("click_after_ms") / 1000, _hard_max_wait()))
 
 
 def _clear_input_line(client: KvmClient) -> None:
@@ -526,7 +726,7 @@ async def _do_paste_unicode_text(
 # Tools that generate HID input on the target. Everything else (capture, image state,
 # health, config, target selection) stays available while locked.
 INPUT_TOOLS = {
-    "type_text", "send_key", "send_key_sequence",
+    "type_text", "send_key",
     "mouse_move", "mouse_click", "mouse_drag", "mouse_scroll",
     "open_shell", "paste_unicode_text", "transfer_unicode_file",
 }
@@ -833,51 +1033,36 @@ app = Server("mcp-serial-hid-kvm")
 
 
 async def _all_tools() -> list[Tool]:
-    """All callable definitions, including deprecated/setup aliases."""
+    """All callable definitions, including tools hidden from list_tools."""
     tools = [
         Tool(
             name="type_text",
             description=(
-                'Type a string as keyboard input on the target PC. Supports inline tags: {enter}, {tab}, {ctrl+c}, {shift+0x87}, etc. '
-                '{0xNN} sends any HID keycode by hex value (0x00-0xFF) for keys without a named tag, e.g. {0x87} = JIS ろ key (International1).\n'
-                '\n'
-                '**Whitelist-based tag parsing:** Only recognized special key names inside {braces} are interpreted as tags. '
-                'Unknown {content} (e.g. {print $1}) is passed through as literal text including the braces. '
-                'This means code with curly braces (awk, Python, shell) can be sent without escaping in most cases.\n'
-                '\n'
-                '**Escaping:** Use {{ and }} to force literal braces when they collide with a recognized tag name '
-                '(e.g. {{enter}} to type the literal text "{enter}").\n'
-                '\n'
-                '**Raw mode (raw=true):** Disables ALL tag interpretation. '
-                'Actual line breaks in the input (LF, CRLF, CR) are sent as Enter key presses. '
-                'In JSON, \\n is decoded into an actual line break, so it becomes Enter. '
-                'To type a literal backslash + n, use \\\\n in JSON.\n'
-                '\n'
-                'Examples:\n'
-                '  "ls -la{enter}"                     → types "ls -la" then presses Enter\n'
-                '  "awk \'{print $1}\' file.txt{enter}"  → types the awk command then Enter (braces preserved)\n'
-                '  "echo {{enter}}"                    → types "echo {enter}" (escaped to avoid tag)\n'
-                '  raw=true: "ls -la\\necho hi\\n"       → types "ls -la", Enter, "echo hi", Enter\n'
-                '\n'
-                '**Supported characters:** ASCII printable (space through ~), tab, and newline only. '
-                'Unicode, CJK, accented characters, and control characters cause an error. '
-                'For unsupported characters or binary data, use base64 encoding as a workaround: '
-                'encode on the host and type a decode command (e.g. `echo <b64> | base64 -d`) on the target.'
+                "Type ASCII text on the target. Inline {tags} press keys: {enter}, {tab}, {esc}, "
+                "{ctrl+c}, {alt+f4}, {0x87} (raw HID keycode 0x00-0xFF). Only known key names are tags; "
+                "other braces (awk '{print $1}') are typed as-is. {{ and }} type a literal brace "
+                "({{enter}} types \"{enter}\"). Line breaks press Enter (JSON \\n = Enter, \\\\n = "
+                "backslash+n). Only ASCII printable, tab and newline; anything else is an error "
+                "(use paste_unicode_text for Unicode)."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "Text with optional {tag} sequences. Tags: {enter}/{return}, {space}, {tab}, {backspace}, {delete}, {insert}, {escape}/{esc}, {up}, {down}, {left}, {right}, {home}, {end}, {pageup}, {pagedown}, {f1}-{f12}, {capslock}, {numlock}, {scrolllock}, {printscreen}, {pause}, {0xNN} for raw HID keycodes (0x00-0xFF). Modifiers: ctrl/lctrl/rctrl, shift/lshift/rshift, alt/lalt/ralt, win/lwin/rwin/gui/super/meta — combine with +: {ctrl+c}, {alt+f4}, {ctrl+shift+del}, {shift+0x87}. Only recognized key names are treated as tags; other braces pass through literally.",
+                        "description": "Text with optional {tags}. Keys: enter, space, tab, backspace, delete, insert, esc, up, down, left, right, home, end, pageup, pagedown, f1-f12, capslock, numlock, scrolllock, printscreen, pause, 0xNN. Modifiers ctrl/shift/alt/win joined with +: {ctrl+shift+esc}, {shift+0x87}.",
                     },
                     "raw": {
                         "type": "boolean",
-                        "description": "If true, disable all {tag} interpretation. Actual line breaks (LF, CRLF, CR) become Enter. In JSON, \\n is decoded into a line break and becomes Enter; \\\\n types literal backslash + n. Default: false.",
+                        "description": "Disable all {tag} parsing; only line breaks act as Enter. Default false.",
+                    },
+                    "ime_off": {
+                        "type": "boolean",
+                        "description": "First press HID 0x91 (Japanese IME off: half-width alphanumeric), as open_shell does. Default false.",
                     },
                     "char_delay_ms": {
                         "type": "integer",
-                        "description": "Delay between characters in milliseconds (default: 20)",
+                        "description": "Delay between characters in ms (default 20).",
                     },
                 },
                 "required": ["text"],
@@ -900,40 +1085,6 @@ async def _all_tools() -> list[Tool]:
                     },
                 },
                 "required": ["key"],
-            },
-        ),
-        Tool(
-            name="send_key_sequence",
-            description="Send a sequence of key steps with optional per-step delays. Useful for complex keyboard operations.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "steps": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "key": {"type": "string", "description": "Key name"},
-                                "modifiers": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "Modifier keys",
-                                },
-                                "delay_ms": {
-                                    "type": "integer",
-                                    "description": "Delay after this step in ms (default: 100)",
-                                },
-                            },
-                            "required": ["key"],
-                        },
-                        "description": "List of key steps to execute",
-                    },
-                    "default_delay_ms": {
-                        "type": "integer",
-                        "description": "Default delay between steps in ms (default: 100)",
-                    },
-                },
-                "required": ["steps"],
             },
         ),
         Tool(
@@ -960,7 +1111,7 @@ async def _all_tools() -> list[Tool]:
         ),
         Tool(
             name="mouse_click",
-            description="Click a mouse button on the target PC, optionally at a specific position.",
+            description="Click a mouse button on the target PC, optionally at a specific position. count=2/3 double/triple-clicks within the Windows double-click time.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -977,13 +1128,19 @@ async def _all_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Optional Y screen coordinate to click at",
                     },
+                    "count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 3,
+                        "description": "Clicks: 1 (default), 2 = double-click, 3 = triple-click.",
+                    },
                 },
                 "required": [],
             },
         ),
         Tool(
             name="mouse_drag",
-            description="Drag from one position to another (press button at start, move to end, release). Useful for drag-and-drop, selecting text, resizing windows, etc.",
+            description="Press at start, move to end, release (drag-and-drop, text selection, resizing).",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1008,13 +1165,19 @@ async def _all_tools() -> list[Tool]:
                         "enum": ["left", "right", "middle"],
                         "description": "Mouse button (default: left)",
                     },
+                    "steps": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Moves from start to end (default 1). Use 5-20 for apps that need intermediate motion events.",
+                    },
                 },
                 "required": ["start_x", "start_y", "end_x", "end_y"],
             },
         ),
         Tool(
             name="mouse_scroll",
-            description="Scroll the mouse wheel on the target PC.",
+            description="Scroll the mouse wheel on the target PC, optionally after moving to x/y.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1022,16 +1185,52 @@ async def _all_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Scroll amount: positive=up, negative=down (-127 to 127)",
                     },
+                    "x": {
+                        "type": "integer",
+                        "description": "Optional X screen coordinate to scroll at (pass with y)",
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "Optional Y screen coordinate to scroll at (pass with x)",
+                    },
                 },
                 "required": ["amount"],
             },
         ),
         Tool(
             name="capture_screen",
-            description="Capture the target PC screen for the calling Vision model. Stores this full frame as the pre-action baseline.",
+            description=(
+                "Capture the target screen as JPEG, followed by a short JSON text: sizes, region, "
+                "scale and the image->HID formula. Always stores the full frame as the change baseline. "
+                "Options: region to crop, zoom to enlarge it, max_width to shrink, grid for "
+                "HID-coordinate labels usable by mouse_click."
+            ),
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "region": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "minItems": 4,
+                        "maxItems": 4,
+                        "description": "[x, y, w, h] in capture pixels; return only this area.",
+                    },
+                    "zoom": {
+                        "type": "number",
+                        "minimum": 1,
+                        "maximum": _ZOOM_MAX,
+                        "description": "Enlarge the region 1-4x (default 1). Requires region.",
+                    },
+                    "max_width": {
+                        "type": "integer",
+                        "minimum": 64,
+                        "description": "Shrink the returned image to at most this width (saves tokens).",
+                    },
+                    "grid": {
+                        "type": "boolean",
+                        "description": "Overlay a labelled grid in HID coordinates (default false).",
+                    },
+                },
                 "required": [],
             },
         ),
@@ -1091,7 +1290,10 @@ async def _all_tools() -> list[Tool]:
         # -------------------------------------------------------------------
         Tool(
             name="health",
-            description="Compact readiness check for the whole stack (API, serial, video). Returns small JSON, never an image.",
+            description=(
+                "Compact readiness check (API, serial, video) plus device identity: target, API host/port, "
+                "serial port and VID:PID, HID and capture size, configured targets. Small JSON, never an image."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -1132,7 +1334,7 @@ async def _all_tools() -> list[Tool]:
         ),
         Tool(
             name="cursor_crop",
-            description="Return a small image crop around a coordinate (or the best-effort tracked cursor). Only V2 tool that returns an image. FIRST USE: pass x/y, or call mouse_move/mouse_click first to set the tracked cursor; otherwise returns {ok:false,error:'cursor_unknown'} (the stack cannot read the real OS cursor).",
+            description="Small image crop with a crosshair around x/y or the tracked cursor. Without x/y it needs a prior mouse_move/mouse_click (the real OS cursor cannot be read), else error cursor_unknown.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1196,49 +1398,48 @@ async def _all_tools() -> list[Tool]:
         Tool(
             name="paste_unicode_text",
             description=(
-                "Transfer Unicode text (Japanese, Chinese, etc.) to the Target clipboard "
-                "via UTF-8 Base64URL typed through PowerShell. Inspect the target first, then send Ctrl+V separately. "
-                "Good for short/medium text (1-500 CJK chars ≈ 2-22 s at fast_timing). "
-                "Large text is slow over HID; use transfer_unicode_file for > 1000 chars."
+                "Put Unicode text (Japanese, Chinese, ...) on the Target clipboard by typing a Base64 "
+                "PowerShell command. Inspect the result, then send Ctrl+V separately. For files or "
+                ">1000 chars use transfer_unicode_file."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "Unicode text to set on the Target clipboard. Supports Japanese, Chinese, English, newlines, and symbols.",
+                        "description": "Unicode text for the Target clipboard (newlines OK).",
                     },
                     "focus_shell": {
                         "type": "boolean",
-                        "description": "Open/focus Target PowerShell before setting clipboard (default true).",
+                        "description": "Open a Target PowerShell via Win+R first (default true).",
                     },
                     "wait_seconds": {
                         "type": "number",
-                        "description": "Seconds to wait after executing the PowerShell clipboard command (default 1.0).",
+                        "description": "Wait after the clipboard command (default 1.0).",
                     },
                     "fast_timing": {
                         "type": "boolean",
-                        "description": "Temporarily speed up HID typing for the Base64 payload, then restore prior timing (default true).",
+                        "description": "Temporarily speed up HID typing, then restore (default true).",
                     },
                     "type_key_ms": {
                         "type": "integer",
-                        "description": "Per-key hold in ms when fast_timing=true (default 5).",
+                        "description": "Key hold ms with fast_timing (default 5).",
                     },
                     "type_inter_key_ms": {
                         "type": "integer",
-                        "description": "Inter-key delay in ms when fast_timing=true (default 5).",
+                        "description": "Inter-key delay ms with fast_timing (default 5).",
                     },
                     "type_shift_ms": {
                         "type": "integer",
-                        "description": "Shift/modifier staging delay in ms when fast_timing=true (default 0).",
+                        "description": "Modifier delay ms with fast_timing (default 0).",
                     },
                     "max_text_chars": {
                         "type": "integer",
-                        "description": "Safety cap for Unicode character count (default 1200).",
+                        "description": "Safety cap on characters (default 1200).",
                     },
                     "dry_run": {
                         "type": "boolean",
-                        "description": "Return size/estimate metadata without typing anything (default false).",
+                        "description": "Only return sizes and time estimate; no input (default false).",
                     },
                 },
                 "required": ["text"],
@@ -1247,58 +1448,56 @@ async def _all_tools() -> list[Tool]:
         Tool(
             name="transfer_unicode_file",
             description=(
-                "Write Unicode text (Japanese runbooks, templates, configs) to a FILE on the Target "
-                "as exact UTF-8 bytes (no BOM), via chunked Base64URL typed through PowerShell. "
-                "Echoes a SHA-256 prefix on the target for the calling Vision model to verify. "
-                "Use paste_unicode_text for clipboard/short text; this tool for files or >1000 chars. "
-                "Call with dry_run=true first to see the time estimate."
+                "Write Unicode text to a FILE on the Target as exact UTF-8 (no BOM) via chunked Base64 "
+                "typed into PowerShell; the Target echoes a SHA-256 prefix to check on screen. "
+                "Call with dry_run=true first for the time estimate."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "File content (Unicode OK). Written as UTF-8 without BOM.",
+                        "description": "File content (Unicode OK), written as UTF-8 without BOM.",
                     },
                     "target_path": {
                         "type": "string",
-                        "description": "Absolute ASCII path on the target, e.g. C:\\Temp\\runbook.md. Single quotes are escaped; environment variables are NOT expanded.",
+                        "description": "Absolute ASCII path on the target, e.g. C:\\Temp\\notes.md. Environment variables are NOT expanded.",
                     },
                     "chunk_chars": {
                         "type": "integer",
-                        "description": "Base64 chars per Add-Content chunk (default 2500, min 100).",
+                        "description": "Base64 chars per chunk (default 2500, min 100).",
                     },
                     "focus_shell": {
                         "type": "boolean",
-                        "description": "Open/focus Target PowerShell first via Win+R (default true).",
+                        "description": "Open a Target PowerShell via Win+R first (default true).",
                     },
                     "wait_seconds": {
                         "type": "number",
-                        "description": "Wait after the final decode command before returning (default 2.0).",
+                        "description": "Wait after the final decode command (default 2.0).",
                     },
                     "fast_timing": {
                         "type": "boolean",
-                        "description": "Temporarily speed up HID typing, then restore prior timing (default true).",
+                        "description": "Temporarily speed up HID typing, then restore (default true).",
                     },
                     "type_key_ms": {
                         "type": "integer",
-                        "description": "Per-key hold in ms when fast_timing=true (default 5).",
+                        "description": "Key hold ms with fast_timing (default 5).",
                     },
                     "type_inter_key_ms": {
                         "type": "integer",
-                        "description": "Inter-key delay in ms when fast_timing=true (default 5).",
+                        "description": "Inter-key delay ms with fast_timing (default 5).",
                     },
                     "type_shift_ms": {
                         "type": "integer",
-                        "description": "Shift/modifier staging delay in ms when fast_timing=true (default 0).",
+                        "description": "Modifier delay ms with fast_timing (default 0).",
                     },
                     "max_text_chars": {
                         "type": "integer",
-                        "description": "Safety cap for content length (default 8000; ~8000 CJK chars take several minutes over HID).",
+                        "description": "Safety cap on characters (default 8000; takes minutes over HID).",
                     },
                     "dry_run": {
                         "type": "boolean",
-                        "description": "Return sizes/chunk count/time estimate without typing anything (default false).",
+                        "description": "Only return sizes, chunk count and time estimate; no input (default false).",
                     },
                 },
                 "required": ["text", "target_path"],
@@ -1311,17 +1510,15 @@ async def _all_tools() -> list[Tool]:
         Tool(
             name="save_evidence",
             description=(
-                "Capture the target screen and save it on the HOST under a structured evidence path: "
-                "<evidence_dir>/<label>/<YYYYMMDD_HHMMSS>[_<step>].png. For work-evidence workflows "
-                "(e.g. label=INC51031_F56_ST22, step=before/after). Returns the saved path, never an image. "
-                "Evidence dir: SHKVM_EVIDENCE_DIR (default ~/Documents/kvm-evidence)."
+                "Capture the target screen and save it on the HOST as "
+                "<SHKVM_EVIDENCE_DIR>/<label>/<YYYYMMDD_HHMMSS>[_<step>].png. Returns the saved path, never an image."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "label": {
                         "type": "string",
-                        "description": "Folder label, e.g. INC51031_F56_ST22. Sanitized to [A-Za-z0-9_-].",
+                        "description": "Folder label, e.g. TICKET123_review. Sanitized to [A-Za-z0-9_-].",
                     },
                     "step": {
                         "type": "string",
@@ -1335,7 +1532,7 @@ async def _all_tools() -> list[Tool]:
                     "image_format": {
                         "type": "string",
                         "enum": ["png", "jpg"],
-                        "description": "png (default, lossless — best for evidence) or jpg.",
+                        "description": "png (default, lossless) or jpg.",
                     },
                     "quality": {
                         "type": "integer",
@@ -1357,16 +1554,15 @@ async def _all_tools() -> list[Tool]:
         Tool(
             name="select_target",
             description=(
-                "Switch the active KVM server (multi-PC setups: one serial-hid-kvm instance per target PC). "
-                "Pass a configured name (see list_targets) or an explicit host+port. Resets screen baseline "
-                "and cursor tracking, then pings the new target."
+                "Switch the active KVM server (one serial-hid-kvm per target PC) by configured name "
+                "(see list_targets) or host+port. Pings first; resets screen baseline and cursor tracking."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Configured target name from SHKVM_TARGETS (e.g. aws-pc, sap-pc).",
+                        "description": "Configured target name from SHKVM_TARGETS (e.g. target1).",
                     },
                     "host": {
                         "type": "string",
@@ -1383,9 +1579,9 @@ async def _all_tools() -> list[Tool]:
         Tool(
             name="set_input_lock",
             description=(
-                "Production interlock: when locked, every HID-generating tool (keyboard, mouse, run_*, paste/transfer) "
-                "is refused with error=input_locked, while capture/image-state/health stay available — safe read-only observation "
-                "of production screens. Unlocking requires confirm='UNLOCK'. In-memory only (cleared on MCP restart)."
+                "Production interlock: when locked, every HID input tool (keyboard, mouse, shell, paste/transfer) "
+                "is refused with error=input_locked; capture, image-state and health stay available. "
+                "Unlocking requires confirm='UNLOCK'. In-memory only (cleared on MCP restart)."
             ),
             inputSchema={
                 "type": "object",
@@ -1396,7 +1592,7 @@ async def _all_tools() -> list[Tool]:
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Why the lock is set, e.g. 'observing PRD F56'. Echoed in refusals.",
+                        "description": "Why the lock is set, e.g. 'observing production'. Echoed in refusals.",
                     },
                     "confirm": {
                         "type": "string",
@@ -1468,6 +1664,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             char_delay = arguments.get("char_delay_ms")
             raw = arguments.get("raw", False)
             validate_chars(text)
+            if arguments.get("ime_off", False):
+                client.send_key("0x91")  # Japanese IME Off, as in open_shell.
+                await asyncio.sleep(0.15)
             result = client.type_text(text, char_delay, raw=raw)
             return [TextContent(type="text", text=f"Typed {len(text)} characters")]
 
@@ -1477,12 +1676,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             client.send_key(key, modifiers)
             mod_str = "+".join(modifiers) + "+" if modifiers else ""
             return [TextContent(type="text", text=f"Sent: {mod_str}{key}")]
-
-        elif name == "send_key_sequence":
-            steps = arguments["steps"]
-            default_delay = arguments.get("default_delay_ms", 100)
-            client.send_key_sequence(steps, default_delay)
-            return [TextContent(type="text", text=f"Sent {len(steps)} key steps")]
 
         elif name == "mouse_move":
             x = arguments["x"]
@@ -1500,11 +1693,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             button = arguments.get("button", "left")
             x = arguments.get("x")
             y = arguments.get("y")
-            client.mouse_click(button, x, y)
+            count = arguments.get("count", 1)
+            if type(count) is not int or not 1 <= count <= 3:
+                raise ValueError("count must be 1, 2 or 3")
+            if count == 1:
+                client.mouse_click(button, x, y)
+            else:
+                await _do_multi_click(client, button, x, y, count)
             if x is not None and y is not None:
                 _set_cursor(x, y)
             pos_str = f" at ({x}, {y})" if x is not None and y is not None else ""
-            return [TextContent(type="text", text=f"Clicked {button}{pos_str}")]
+            verb = {1: "Clicked", 2: "Double-clicked", 3: "Triple-clicked"}[count]
+            return [TextContent(type="text", text=f"{verb} {button}{pos_str}")]
 
         elif name == "mouse_drag":
             start_x = arguments["start_x"]
@@ -1512,10 +1712,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             end_x = arguments["end_x"]
             end_y = arguments["end_y"]
             button = arguments.get("button", "left")
+            steps = arguments.get("steps", 1)
+            if type(steps) is not int or not 1 <= steps <= 50:
+                raise ValueError("steps must be an integer between 1 and 50")
             client.mouse_down(button, start_x, start_y)
             await asyncio.sleep(0.05)
-            client.mouse_move(end_x, end_y)
-            await asyncio.sleep(0.05)
+            for i in range(1, steps + 1):
+                client.mouse_move(round(start_x + (end_x - start_x) * i / steps),
+                                  round(start_y + (end_y - start_y) * i / steps))
+                await asyncio.sleep(0.05)
             client.mouse_up(button, end_x, end_y)
             _set_cursor(end_x, end_y)
             return [TextContent(
@@ -1525,34 +1730,43 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
         elif name == "mouse_scroll":
             amount = arguments["amount"]
+            x = arguments.get("x")
+            y = arguments.get("y")
+            if (x is None) != (y is None):
+                raise ValueError("mouse_scroll needs both x and y, or neither")
+            if x is not None:
+                client.mouse_move(x, y)
+                _set_cursor(x, y)
+                await asyncio.sleep(0.05)
             client.mouse_scroll(amount)
             direction = "up" if amount > 0 else "down"
-            return [TextContent(type="text", text=f"Scrolled {direction} by {abs(amount)}")]
+            pos_str = f" at ({x}, {y})" if x is not None else ""
+            return [TextContent(type="text", text=f"Scrolled {direction} by {abs(amount)}{pos_str}")]
 
         elif name == "capture_screen":
-            image = _capture_image()
+            jpeg_bytes, image = _capture_frame()
+            # Validate options before touching the baseline.
+            view, box, grid_step = _capture_view(
+                image, _get_screen_size(), region=arguments.get("region"),
+                zoom=arguments.get("zoom"), max_width=arguments.get("max_width"),
+                grid=bool(arguments.get("grid", False)))
             _copies.observe({"host": _current_target["host"], "port": int(_current_target["port"])})
-            _state.set_baseline(image)
+            _state.set_baseline(image)  # always the full frame
             _save_capture_log(image, "capture")
-            # Use JPEG to keep size under 20MB (base64 limit)
-            quality = 85
-            buffer = io.BytesIO()
-            image.save(buffer, format="JPEG", quality=quality)
-            # If still too large, reduce quality then resize
-            while buffer.tell() > 10_000_000 and quality > 20:
-                quality -= 15
-                buffer = io.BytesIO()
-                image.save(buffer, format="JPEG", quality=quality)
-            if buffer.tell() > 10_000_000:
-                image = image.resize((image.width // 2, image.height // 2))
-                buffer = io.BytesIO()
-                image.save(buffer, format="JPEG", quality=60)
-            b64_image = base64.standard_b64encode(buffer.getvalue()).decode("utf-8")
-            return [ImageContent(
-                type="image",
-                data=b64_image,
-                mimeType="image/jpeg",
-            )]
+            if view is None and len(jpeg_bytes) <= 10_000_000:
+                # Untransformed: return the KVM's JPEG without a second compression.
+                data, final = jpeg_bytes, image
+            else:
+                data, final = _encode_capture_jpeg(view if view is not None else image)
+            meta = _capture_meta(image.size, _get_screen_size(), box, final.size, grid_step)
+            return [
+                ImageContent(
+                    type="image",
+                    data=base64.standard_b64encode(data).decode("utf-8"),
+                    mimeType="image/jpeg",
+                ),
+                TextContent(type="text", text=json.dumps(meta)),
+            ]
 
 
         elif name == "get_device_info":
@@ -1602,14 +1816,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             result["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
             return [TextContent(type="text", text=json.dumps(result))]
 
-        elif name in ("screen_changed", "get_changed_regions"):
+        elif name == "get_changed_regions":
             result = _state.observe(
                 _capture_image(), threshold=arguments.get("threshold", get_config().get("screen_change_threshold")),
                 region=arguments.get("region"), min_changed_area=arguments.get("min_changed_area"),
                 auto_baseline=arguments.get("auto_baseline", False))
             return [TextContent(type="text", text=json.dumps(result))]
 
-        elif name in ("wait_for_change", "wait_for_screen_change", "wait_for_stable"):
+        elif name in ("wait_for_change", "wait_for_stable"):
             cfg = get_config()
             kwargs = {
                 "timeout_seconds": arguments.get("timeout_seconds", cfg.get("wait_timeout_seconds")),

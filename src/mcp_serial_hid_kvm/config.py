@@ -86,23 +86,31 @@ def parse_targets(raw: str | None, default_host: str, default_port: int) -> dict
     return targets
 
 
-# Tools hidden from list_tools by default: superseded legacy tools and
+# Tools hidden from list_tools by default: rarely used tuning/state tools and
 # setup-time device management. Calls to them still work (hidden != disabled);
 # override with SHKVM_HIDDEN_TOOLS (comma-separated, or "none" to show all).
 DEFAULT_HIDDEN_TOOLS = frozenset({
-    "screen_changed",          # deprecated alias of get_changed_regions
-    "wait_for_screen_change",  # deprecated alias of wait_for_change
-    "send_key_sequence",       # covered by type_text {tags} + send_key
+    "configure",               # runtime tuning; get_timing stays visible
+    "set_screen_baseline",     # capture_screen already stores the baseline
+    "get_changed_regions",     # wait_for_change returns the same regions
     "list_capture_devices",    # setup-time: use examples/ scripts instead
     "set_capture_device",
     "set_capture_resolution",
 })
 
 
-def parse_hidden_tools(raw: str | None) -> set:
-    """Parse SHKVM_HIDDEN_TOOLS. None -> defaults; ''/'none' -> hide nothing."""
+def parse_hidden_tools(raw: str | None, targets: dict | None = None) -> set:
+    """Parse SHKVM_HIDDEN_TOOLS. None -> defaults; ''/'none' -> hide nothing.
+
+    With *targets*, the default also hides select_target unless more than one
+    distinct endpoint is configured ("default" often aliases a named target).
+    """
     if raw is None:
-        return set(DEFAULT_HIDDEN_TOOLS)
+        hidden = set(DEFAULT_HIDDEN_TOOLS)
+        if targets is not None and len(
+                {(s["host"], s["port"]) for s in targets.values()}) <= 1:
+            hidden.add("select_target")
+        return hidden
     if raw.strip().lower() in ("", "none"):
         return set()
     return {t.strip() for t in raw.split(",") if t.strip()}
@@ -133,7 +141,7 @@ class Config:
 
         # Tools hidden from list_tools (still callable)
         self.hidden_tools: set = parse_hidden_tools(
-            os.environ.get("SHKVM_HIDDEN_TOOLS"))
+            os.environ.get("SHKVM_HIDDEN_TOOLS"), self.targets)
 
         # Evidence directory for save_evidence (empty string disables)
         raw_ev = os.environ.get("SHKVM_EVIDENCE_DIR")
