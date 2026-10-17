@@ -15,6 +15,7 @@ from mcp_serial_hid_kvm.runtime_config import RuntimeConfig
 from mcp_serial_hid_kvm.vision import StateEngine
 
 REMOVED = {
+    "save_evidence",
     "get_screen_text", "get_screen_text_compact", "detect_text_elements", "click_text",
     "wait_for_text", "get_terminal_output", "run_powershell_and_read", "run_wsl_and_read",
     "execute_and_read", "run_powershell_until_done", "run_task_and_report",

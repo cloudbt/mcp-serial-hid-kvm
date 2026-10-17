@@ -46,13 +46,6 @@ def _default_capture_log_dir() -> str:
     return os.path.join(base, "mcp-serial-hid-kvm", "captures")
 
 
-def _default_evidence_dir() -> str:
-    """Default directory for save_evidence screenshots (user-visible, not cache)."""
-    if platform.system() == "Windows":
-        return os.path.join(os.path.expanduser("~"), "Documents", "kvm-evidence")
-    return os.path.join(os.path.expanduser("~"), "kvm-evidence")
-
-
 def parse_targets(raw: str | None, default_host: str, default_port: int) -> dict:
     """Parse SHKVM_TARGETS JSON into {name: {host, port}}.
 
@@ -142,15 +135,6 @@ class Config:
         # Tools hidden from list_tools (still callable)
         self.hidden_tools: set = parse_hidden_tools(
             os.environ.get("SHKVM_HIDDEN_TOOLS"), self.targets)
-
-        # Evidence directory for save_evidence (empty string disables)
-        raw_ev = os.environ.get("SHKVM_EVIDENCE_DIR")
-        if raw_ev is None:
-            self.evidence_dir: str | None = _default_evidence_dir()
-        elif raw_ev == "":
-            self.evidence_dir = None
-        else:
-            self.evidence_dir = raw_ev
 
 
 config = Config()

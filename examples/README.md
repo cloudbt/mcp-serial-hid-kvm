@@ -5,6 +5,11 @@ These scripts talk **directly** to the serial-hid-kvm TCP JSON Lines API
 screen content to an AI — everything stays on the host PC. Python scripts are
 **stdlib-only** (any Python ≥ 3.10, no venv needed).
 
+The MCP-only `after` option is documented in [action observation](../docs/action-after.md);
+it is not a TCP parameter for these scripts. The removed MCP `save_evidence`
+tool and `SHKVM_EVIDENCE_DIR` setting are no longer available. Existing direct
+TCP scripts below are independent of that removed MCP implementation.
+
 ```
 your script ──TCP 9329──▶ serial-hid-kvm ──USB/HDMI──▶ Target PC
 ```

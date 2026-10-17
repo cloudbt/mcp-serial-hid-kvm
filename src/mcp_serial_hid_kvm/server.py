@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import re
+import time
 from typing import Any
 
 from mcp.server import Server
@@ -22,13 +23,17 @@ from mcp.server.stdio import stdio_server
 from mcp.types import ImageContent, TextContent, Tool
 from PIL import Image, ImageDraw, ImageFont
 from serial_hid_kvm.client import KvmClient, KvmClientError
-from serial_hid_kvm.hid_keycodes import validate_chars
+from serial_hid_kvm.hid_keycodes import (
+    char_to_hid, modifier_name_to_bit, special_key_to_hid, validate_chars,
+)
 
 from .config import config
 from .vision import StateEngine
 from .vision.tools import state_tools
 from .runtime_config import RuntimeConfig
 from .file_copy import CopyManager, file_copy_tools
+from .after import ACTION_TOOLS, after_schema, validate_options
+from .vision.state import _roi
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -80,21 +85,6 @@ def _hard_max_wait() -> float:
 # ---------------------------------------------------------------------------
 
 
-def _crop_region(image: Image.Image, region: Any) -> Image.Image:
-    """Crop ``image`` to ``region`` = [x, y, w, h]; return image if region is falsy."""
-    if not region:
-        return image
-    try:
-        x, y, w, h = (int(v) for v in region)
-    except (TypeError, ValueError):
-        return image
-    x = max(0, min(x, image.width))
-    y = max(0, min(y, image.height))
-    right = max(x, min(x + w, image.width))
-    bottom = max(y, min(y + h, image.height))
-    return image.crop((x, y, right, bottom))
-
-
 def get_client() -> KvmClient:
     global _client
     if _client is None:
@@ -139,10 +129,12 @@ def _save_capture_log(image: Image.Image, suffix: str = "") -> str | None:
         return None
 
 
-def _capture_frame(quality: int = 85) -> tuple[bytes, Image.Image]:
+def _capture_frame(quality: int = 85, *, client=None) -> tuple[bytes, Image.Image]:
     """Fetch a frame from KVM server: the original JPEG bytes and a PIL Image."""
-    jpeg_bytes, w, h = get_client().capture_frame_jpeg(quality)
-    return jpeg_bytes, Image.open(io.BytesIO(jpeg_bytes))
+    jpeg_bytes, w, h = (client if client is not None else get_client()).capture_frame_jpeg(quality)
+    image = Image.open(io.BytesIO(jpeg_bytes))
+    image.load()
+    return jpeg_bytes, image
 
 
 def _capture_image(quality: int = 85) -> Image.Image:
@@ -211,7 +203,7 @@ def _draw_grid(view: Image.Image, box: list, capture_size: tuple[int, int],
 
 
 def _capture_view(image: Image.Image, hid_size: tuple[int, int], *, region=None,
-                  zoom=None, max_width=None, grid=False):
+                  zoom=None, max_width=None, grid=False, _validate_only=False):
     """Apply capture_screen's optional region/zoom/max_width/grid to a frame.
 
     Returns ``(view, box, grid_step)``. view is None when no option changes the
@@ -238,6 +230,8 @@ def _capture_view(image: Image.Image, hid_size: tuple[int, int], *, region=None,
         raise ValueError("zoom requires region")
     if max_width is not None and (type(max_width) is not int or max_width < 64):
         raise ValueError("max_width must be an integer >= 64")
+    if _validate_only:
+        return None, box, None
 
     view = image
     if box != [0, 0, cw, ch]:
@@ -413,13 +407,14 @@ def _do_health(client: KvmClient) -> dict:
 _MULTI_CLICK_GAP = 0.08
 
 
-async def _do_multi_click(client, button: str, x, y, count: int) -> None:
+async def _do_multi_click(client, button: str, x, y, count: int, guard=lambda: None) -> None:
     """Press/release *count* times with short fixed gaps (double/triple click)."""
     cfg = get_config()
     hold = min(cfg.get("click_hold_ms"), 100) / 1000
     for i in range(count):
         if i:
             await asyncio.sleep(_MULTI_CLICK_GAP)
+        guard()
         client.mouse_down(button, x, y)
         await asyncio.sleep(hold)
         client.mouse_up(button, x, y)
@@ -835,49 +830,6 @@ def _do_list_targets() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# save_evidence
-# ---------------------------------------------------------------------------
-
-def _sanitize_label(label) -> str:
-    """Reduce a label to filesystem-safe [A-Za-z0-9_-]; empty when nothing survives."""
-    if not label:
-        return ""
-    return re.sub(r"[^A-Za-z0-9_\-]+", "_", str(label).strip()).strip("_")
-
-
-def _do_save_evidence(*, label, step=None, region=None, image_format="png",
-                      quality=90) -> dict:
-    base = config.evidence_dir
-    if not base:
-        return {"ok": False, "error": "no_evidence_dir",
-                "detail": "SHKVM_EVIDENCE_DIR is disabled (set to a directory to enable)."}
-    clean_label = _sanitize_label(label)
-    if not clean_label:
-        return {"ok": False, "error": "bad_label",
-                "detail": "label must contain letters/digits (e.g. INC51031_F56_ST22)."}
-    clean_step = _sanitize_label(step)
-    image = _crop_region(_capture_image(), region)
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    ext = "jpg" if image_format == "jpg" else "png"
-    filename = ts + (f"_{clean_step}" if clean_step else "") + f".{ext}"
-    dirpath = os.path.join(base, clean_label)
-    try:
-        os.makedirs(dirpath, exist_ok=True)
-        path = os.path.join(dirpath, filename)
-        if ext == "jpg":
-            image.convert("RGB").save(path, format="JPEG",
-                                      quality=max(1, min(100, int(quality))))
-        else:
-            image.save(path, format="PNG")
-        size = os.path.getsize(path)
-    except OSError as e:
-        return {"ok": False, "error": "save_failed", "detail": str(e)}
-    return {"ok": True, "path": path, "label": clean_label,
-            "width": image.width, "height": image.height, "bytes": size,
-            "target": _current_target["name"]}
-
-
-# ---------------------------------------------------------------------------
 # transfer_unicode_file helpers
 # ---------------------------------------------------------------------------
 
@@ -1030,6 +982,224 @@ async def _do_transfer_unicode_file(
 
 # Create MCP server
 app = Server("mcp-serial-hid-kvm")
+
+
+def _validate_action(name, arguments):
+    """Validate the entire input before the first HID request (including IME off)."""
+    if name == "type_text":
+        if not isinstance(arguments["text"], str):
+            raise ValueError("text must be a string")
+        validate_chars(arguments["text"])
+        for key in ("raw", "ime_off"):
+            if key in arguments and type(arguments[key]) is not bool:
+                raise ValueError(f"{key} must be boolean")
+        delay = arguments.get("char_delay_ms")
+        if delay is not None and (type(delay) is not int or delay < 0):
+            raise ValueError("char_delay_ms must be a nonnegative integer")
+    elif name == "send_key":
+        key = arguments["key"]
+        if (not isinstance(key, str) or not key or
+                (special_key_to_hid(key) is None and
+                 (len(key) != 1 or char_to_hid(key) is None))):
+            raise ValueError(f"Unknown key: {key}")
+        modifiers = arguments.get("modifiers", [])
+        if (not isinstance(modifiers, list) or any(
+                not isinstance(m, str) or modifier_name_to_bit(m) is None for m in modifiers)):
+            raise ValueError("modifiers must contain known modifier names")
+    else:
+        x, y = arguments.get("x"), arguments.get("y")
+        if (x is None) != (y is None):
+            raise ValueError(f"{name} needs both x and y, or neither")
+        if x is not None and (type(x) is not int or type(y) is not int or x < 0 or y < 0):
+            raise ValueError("x and y must be nonnegative HID coordinates")
+        if name == "mouse_click":
+            count = arguments.get("count", 1)
+            if type(count) is not int or not 1 <= count <= 3:
+                raise ValueError("count must be 1, 2 or 3")
+            if arguments.get("button", "left") not in ("left", "right", "middle"):
+                raise ValueError("button must be left, right or middle")
+        elif type(arguments["amount"]) is not int or not -127 <= arguments["amount"] <= 127:
+            raise ValueError("amount must be an integer between -127 and 127")
+
+
+async def _send_action(client, name, arguments, guard=lambda: None):
+    """Send once. A response acknowledges HID delivery, not business success."""
+    guard()
+    if name == "type_text":
+        text = arguments["text"]
+        if arguments.get("ime_off", False):
+            client.send_key("0x91")
+            await asyncio.sleep(0.15)
+            guard()
+        client.type_text(text, arguments.get("char_delay_ms"), raw=arguments.get("raw", False))
+        return f"Typed {len(text)} characters"
+    if name == "send_key":
+        key, modifiers = arguments["key"], arguments.get("modifiers", [])
+        client.send_key(key, modifiers)
+        return f"Sent: {'+'.join(modifiers) + '+' if modifiers else ''}{key}"
+    x, y = arguments.get("x"), arguments.get("y")
+    pos = f" at ({x}, {y})" if x is not None else ""
+    if name == "mouse_click":
+        button, count = arguments.get("button", "left"), arguments.get("count", 1)
+        if count == 1:
+            client.mouse_click(button, x, y)
+        else:
+            await _do_multi_click(client, button, x, y, count, guard)
+            guard()
+        if x is not None:
+            _set_cursor(x, y)
+        verb = {1: "Clicked", 2: "Double-clicked", 3: "Triple-clicked"}[count]
+        return f"{verb} {button}{pos}"
+    if x is not None:
+        client.mouse_move(x, y)
+        _set_cursor(x, y)
+        await asyncio.sleep(0.05)
+        guard()
+    amount = arguments["amount"]
+    client.mouse_scroll(amount)
+    return f"Scrolled {'up' if amount > 0 else 'down'} by {abs(amount)}{pos}"
+
+
+def _stable_options(arguments):
+    cfg = get_config()
+    kwargs = {
+        "timeout_seconds": arguments.get("timeout_seconds", cfg.get("wait_timeout_seconds")),
+        "poll_ms": arguments.get("poll_ms", cfg.get("wait_poll_ms")),
+        "threshold": arguments.get("threshold", cfg.get("screen_stable_threshold")),
+        "stable_frames": arguments.get("stable_frames", cfg.get("screen_stable_frames")),
+        "region": arguments.get("region"),
+        "min_changed_area": arguments.get("min_changed_area"),
+    }
+    StateEngine._wait_args(kwargs["timeout_seconds"], kwargs["poll_ms"], kwargs["threshold"])
+    value = kwargs["min_changed_area"]
+    if value is not None and (isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1):
+        raise ValueError("min_changed_area must be between 0 and 1")
+    if type(kwargs["stable_frames"]) is not int or not 1 <= kwargs["stable_frames"] <= 1000:
+        raise ValueError("stable_frames must be an integer between 1 and 1000")
+    kwargs["timeout_seconds"] = min(kwargs["timeout_seconds"], _hard_max_wait())
+    return kwargs
+
+
+async def _action_after(client, name, arguments, schema, start):
+    after = arguments["after"]
+    validate_options(after, schema)
+    wait = after.get("wait", {})
+    mode = wait.get("mode", "stable")
+    stable = _stable_options(wait) if mode == "stable" else None
+    seconds = wait.get("seconds", 0)
+    if not math.isfinite(seconds):
+        raise ValueError("after.wait.seconds must be finite")
+    screenshot = after.get("screenshot", {})
+    park = after.get("park_cursor")
+    hid_size = _get_screen_size()
+    for position in (park, arguments if arguments.get("x") is not None else None):
+        if position and (not 0 <= position["x"] < hid_size[0] or not 0 <= position["y"] < hid_size[1]):
+            raise ValueError("cursor position must be inside the HID screen")
+    # Frame-dependent ROI validation is read-only and happens BEFORE input.
+    probe = None
+    if screenshot.get("region") is not None or (stable and stable["region"] is not None):
+        probe = _capture_frame(client=client)[1]
+    _capture_view(probe if probe is not None else Image.new("RGB", (1, 1)), hid_size,
+                  _validate_only=True, **screenshot)
+    if stable and stable["region"] is not None:
+        _roi(stable["region"], probe.width, probe.height)
+
+    generation = _state.generation
+    target = dict(_current_target)
+    result = {"ok": False, "tool": name, "target": target, "verified": False,
+              "verification": "calling_model_required",
+              "preparation_ms": round((time.monotonic() - start) * 1000, 3),
+              "action": {"status": "not_sent", "sent": False, "elapsed_ms": 0},
+              "park_cursor": {"status": "skipped", "elapsed_ms": 0},
+              "wait": {"status": "skipped", "mode": mode, "elapsed_ms": 0},
+              "screenshot": {"status": "skipped", "elapsed_ms": 0}}
+    images = []
+
+    def check_context():
+        if generation != _state.generation or client is not _client:
+            raise ValueError("context_changed")
+
+    def check_input():
+        check_context()
+        refusal = _check_input_lock(name, arguments)
+        if refusal:
+            raise ValueError(refusal["error"])
+
+    async def stage(key, operation):
+        began = time.monotonic()
+        try:
+            value = await operation()
+            result[key].update({"status": "ok", **(value or {})})
+        except Exception as exc:
+            # The action distinguishes a pre-send refusal from unknown delivery.
+            if key != "action":
+                result[key]["status"] = "failed"
+            result[key]["error"] = str(exc)
+        finally:
+            result[key]["elapsed_ms"] = round((time.monotonic() - began) * 1000, 3)
+
+    async def action():
+        def attempting_input():
+            check_input()
+            # Once attempted, a transport error may mean partial delivery.
+            result["action"].update(status="unknown", sent=None)
+
+        message = await _send_action(client, name, arguments, attempting_input)
+        return {"sent": True, "message": message}
+
+    await stage("action", action)
+    if result["action"]["status"] == "ok":
+        if park:
+            async def parking():
+                check_input()
+                client.mouse_move(park["x"], park["y"])
+                _set_cursor(park["x"], park["y"])
+                return {"x": park["x"], "y": park["y"]}
+            await stage("park_cursor", parking)
+        last_frame = None
+
+        def capture():
+            nonlocal last_frame
+            check_context()
+            last_frame = _capture_frame(client=client)
+            return last_frame[1]
+
+        async def waiting():
+            check_context()
+            if mode == "stable":
+                observed = await _state.wait_for_stable(capture, **stable)
+                check_context()
+                return {**observed, "status": "failed" if observed.get("error") else
+                        "timeout" if observed.get("timed_out") else "ok"}
+            await asyncio.sleep(min(seconds, _hard_max_wait()))
+            check_context()
+
+        if mode != "none":
+            await stage("wait", waiting)
+            if result["wait"]["status"] == "failed":
+                last_frame = None  # try a current capture after a polling failure
+
+        async def snapshot():
+            check_context()
+            reused = last_frame is not None
+            jpeg_bytes, image = last_frame if reused else _capture_frame(client=client)
+            view, box, step = _capture_view(image, hid_size, **screenshot)
+            if view is None and len(jpeg_bytes) <= 10_000_000:
+                data, final = jpeg_bytes, image
+            else:
+                data, final = _encode_capture_jpeg(view if view is not None else image)
+            # Baseline always keeps the untransformed full frame, with no disk save.
+            _state.set_baseline(image)
+            _copies.observe({"host": target["host"], "port": int(target["port"])})
+            images.append(ImageContent(type="image", data=base64.standard_b64encode(data).decode("utf-8"), mimeType="image/jpeg"))
+            return {"source": "wait_last_frame" if reused else "capture",
+                    **_capture_meta(image.size, hid_size, box, final.size, step)}
+
+        await stage("screenshot", snapshot)
+    result["ok"] = all(result[key]["status"] in ("ok", "skipped")
+                       for key in ("action", "park_cursor", "wait", "screenshot"))
+    result["elapsed_ms"] = round((time.monotonic() - start) * 1000, 3)
+    return [*images, TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
 
 async def _all_tools() -> list[Tool]:
@@ -1504,44 +1674,9 @@ async def _all_tools() -> list[Tool]:
             },
         ),
         # -------------------------------------------------------------------
-        # Ops tools: evidence capture, multi-target,
+        # Ops tools: multi-target,
         # production interlock.
         # -------------------------------------------------------------------
-        Tool(
-            name="save_evidence",
-            description=(
-                "Capture the target screen and save it on the HOST as "
-                "<SHKVM_EVIDENCE_DIR>/<label>/<YYYYMMDD_HHMMSS>[_<step>].png. Returns the saved path, never an image."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "label": {
-                        "type": "string",
-                        "description": "Folder label, e.g. TICKET123_review. Sanitized to [A-Za-z0-9_-].",
-                    },
-                    "step": {
-                        "type": "string",
-                        "description": "Optional step suffix, e.g. before, after, step3.",
-                    },
-                    "region": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Optional [x, y, w, h] region to save. Omit for full frame.",
-                    },
-                    "image_format": {
-                        "type": "string",
-                        "enum": ["png", "jpg"],
-                        "description": "png (default, lossless) or jpg.",
-                    },
-                    "quality": {
-                        "type": "integer",
-                        "description": "JPEG quality 1-100 when image_format=jpg (default 90).",
-                    },
-                },
-                "required": ["label"],
-            },
-        ),
         Tool(
             name="list_targets",
             description="List the configured KVM targets (from SHKVM_TARGETS) and which one is currently active. No hardware access.",
@@ -1605,6 +1740,11 @@ async def _all_tools() -> list[Tool]:
     ]
     tools.extend(state_tools())
     tools.extend(file_copy_tools())
+    definitions = {t.name: t for t in tools}
+    schema = after_schema(definitions["capture_screen"].inputSchema,
+                          definitions["wait_for_stable"].inputSchema)
+    for name in ACTION_TOOLS:
+        definitions[name].inputSchema["properties"]["after"] = schema
     return tools
 
 
@@ -1616,6 +1756,7 @@ async def list_tools() -> list[Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
     """Handle tool calls."""
+    started = time.monotonic()
     try:
         # Production interlock: refuse HID-generating tools while locked.
         lock_error = _check_input_lock(name, arguments or {})
@@ -1654,28 +1795,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
         # Reject removed/unknown tools before opening any hardware connection.
-        known = {tool.name for tool in await _all_tools()}
-        if name not in known:
+        definitions = {tool.name: tool for tool in await _all_tools()}
+        if name not in definitions:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
         client = get_client()
 
-        if name == "type_text":
-            text = arguments["text"]
-            char_delay = arguments.get("char_delay_ms")
-            raw = arguments.get("raw", False)
-            validate_chars(text)
-            if arguments.get("ime_off", False):
-                client.send_key("0x91")  # Japanese IME Off, as in open_shell.
-                await asyncio.sleep(0.15)
-            result = client.type_text(text, char_delay, raw=raw)
-            return [TextContent(type="text", text=f"Typed {len(text)} characters")]
-
-        elif name == "send_key":
-            key = arguments["key"]
-            modifiers = arguments.get("modifiers", [])
-            client.send_key(key, modifiers)
-            mod_str = "+".join(modifiers) + "+" if modifiers else ""
-            return [TextContent(type="text", text=f"Sent: {mod_str}{key}")]
+        if name in ACTION_TOOLS:
+            _validate_action(name, arguments)
+            if "after" in arguments:
+                schema = definitions[name].inputSchema["properties"]["after"]
+                return await _action_after(client, name, arguments, schema, started)
+            message = await _send_action(client, name, arguments)
+            return [TextContent(type="text", text=message)]
 
         elif name == "mouse_move":
             x = arguments["x"]
@@ -1688,23 +1819,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             else:
                 _set_cursor(x, y)
                 return [TextContent(type="text", text=f"Moved mouse to ({x}, {y})")]
-
-        elif name == "mouse_click":
-            button = arguments.get("button", "left")
-            x = arguments.get("x")
-            y = arguments.get("y")
-            count = arguments.get("count", 1)
-            if type(count) is not int or not 1 <= count <= 3:
-                raise ValueError("count must be 1, 2 or 3")
-            if count == 1:
-                client.mouse_click(button, x, y)
-            else:
-                await _do_multi_click(client, button, x, y, count)
-            if x is not None and y is not None:
-                _set_cursor(x, y)
-            pos_str = f" at ({x}, {y})" if x is not None and y is not None else ""
-            verb = {1: "Clicked", 2: "Double-clicked", 3: "Triple-clicked"}[count]
-            return [TextContent(type="text", text=f"{verb} {button}{pos_str}")]
 
         elif name == "mouse_drag":
             start_x = arguments["start_x"]
@@ -1727,21 +1841,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 type="text",
                 text=f"Dragged {button} from ({start_x}, {start_y}) to ({end_x}, {end_y})",
             )]
-
-        elif name == "mouse_scroll":
-            amount = arguments["amount"]
-            x = arguments.get("x")
-            y = arguments.get("y")
-            if (x is None) != (y is None):
-                raise ValueError("mouse_scroll needs both x and y, or neither")
-            if x is not None:
-                client.mouse_move(x, y)
-                _set_cursor(x, y)
-                await asyncio.sleep(0.05)
-            client.mouse_scroll(amount)
-            direction = "up" if amount > 0 else "down"
-            pos_str = f" at ({x}, {y})" if x is not None else ""
-            return [TextContent(type="text", text=f"Scrolled {direction} by {abs(amount)}{pos_str}")]
 
         elif name == "capture_screen":
             jpeg_bytes, image = _capture_frame()
@@ -1824,24 +1923,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             return [TextContent(type="text", text=json.dumps(result))]
 
         elif name in ("wait_for_change", "wait_for_stable"):
-            cfg = get_config()
-            kwargs = {
-                "timeout_seconds": arguments.get("timeout_seconds", cfg.get("wait_timeout_seconds")),
-                "poll_ms": arguments.get("poll_ms", cfg.get("wait_poll_ms")),
-                "threshold": arguments.get("threshold", cfg.get(
-                    "screen_stable_threshold" if name == "wait_for_stable" else "screen_change_threshold")),
-                "region": arguments.get("region"),
-                "min_changed_area": arguments.get("min_changed_area"),
-            }
-            # Validate before clamping: negative/non-finite timeouts are errors.
-            StateEngine._wait_args(kwargs["timeout_seconds"], kwargs["poll_ms"], kwargs["threshold"])
-            kwargs["timeout_seconds"] = min(kwargs["timeout_seconds"], _hard_max_wait())
             if name == "wait_for_stable":
-                kwargs["stable_frames"] = arguments.get("stable_frames", cfg.get("screen_stable_frames"))
-                result = await _state.wait_for_stable(_capture_image, **kwargs)
+                result = await _state.wait_for_stable(_capture_image, **_stable_options(arguments))
             else:
-                kwargs["auto_baseline"] = arguments.get("auto_baseline", True)
-                kwargs["update_baseline_on_change"] = arguments.get("update_baseline_on_change", False)
+                cfg = get_config()
+                kwargs = {
+                    "timeout_seconds": arguments.get("timeout_seconds", cfg.get("wait_timeout_seconds")),
+                    "poll_ms": arguments.get("poll_ms", cfg.get("wait_poll_ms")),
+                    "threshold": arguments.get("threshold", cfg.get("screen_change_threshold")),
+                    "region": arguments.get("region"),
+                    "min_changed_area": arguments.get("min_changed_area"),
+                    "auto_baseline": arguments.get("auto_baseline", True),
+                    "update_baseline_on_change": arguments.get("update_baseline_on_change", False),
+                }
+                StateEngine._wait_args(kwargs["timeout_seconds"], kwargs["poll_ms"], kwargs["threshold"])
+                kwargs["timeout_seconds"] = min(kwargs["timeout_seconds"], _hard_max_wait())
                 result = await _state.wait_for_change(_capture_image, **kwargs)
             return [TextContent(type="text", text=json.dumps(result))]
 
@@ -1916,16 +2012,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 dry_run=arguments.get("dry_run", False),
             )
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
-
-        elif name == "save_evidence":
-            result = _do_save_evidence(
-                label=arguments["label"],
-                step=arguments.get("step"),
-                region=arguments.get("region"),
-                image_format=arguments.get("image_format", "png"),
-                quality=int(arguments.get("quality", 90)))
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
-
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]

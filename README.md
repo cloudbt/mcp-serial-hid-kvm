@@ -29,7 +29,8 @@ Target PC
 ```text
 src/mcp_serial_hid_kvm/
   server.py          MCP handlers → KvmClient calls
-  config.py          endpoints, targets.json, capture/evidence settings
+  config.py          endpoints, targets.json, capture log settings
+  after.py           shared action-observation schema and validation
   runtime_config.py  timing and wait defaults
   vision/state.py    transport-independent image/frame algorithms and waits
   vision/tools.py    MCP image-state schemas
@@ -55,7 +56,7 @@ pip install -e .
 ```
 
 Dependencies: `serial-hid-kvm`, `mcp>=1.0.0`, `pillow>=10.0.0`, `numpy>=1.24.0`,
-`opencv-python>=4.8.0`. OpenCV matches the hardware server; do not install
+`opencv-python>=4.8.0`, `jsonschema>=4.20.0`. OpenCV matches the hardware server; do not install
 `opencv-python-headless` alongside it. No external text-recognition executable
 or language files are required.
 
@@ -88,6 +89,11 @@ capture_screen (also stores the full capture as the pre-action baseline)
 → Vision model verifies result
 ```
 
+For `mouse_scroll`, `mouse_click`, `send_key` and `type_text`, an optional
+`after` combines action → optional cursor parking → wait → screenshot in one
+MCP call. Omitting `after` preserves the original text-only result. See
+[action observation options, stage results and timing](docs/action-after.md).
+
 Capture before acting: `auto_baseline=true` seeds a missing baseline from the
 first polling frame. An immediate change that occurred before that frame cannot
 be recovered. `set_screen_baseline` explicitly sets a reference without returning
@@ -101,7 +107,7 @@ The calling model must inspect the final capture.
 
 ## Available tools
 
-30 tools are callable; 24 are advertised by default (23 when only one Target
+29 tools are callable; 23 are advertised by default (22 when only one Target
 endpoint is configured). Tools marked hidden are setup or rarely used tuning/state
 tools; hidden tools remain callable. `select_target` is hidden by default only when
 the configured targets resolve to a single endpoint. `SHKVM_HIDDEN_TOOLS` replaces
@@ -130,7 +136,6 @@ exposed or invoked.
 | `open_shell` | HID shell launch only; `verified=false`, calling model verifies focus |
 | `paste_unicode_text` | Base64URL → Target clipboard; dry-run sizes, SHA-256 and timing estimate |
 | `transfer_unicode_file` | Chunked Base64URL → Target UTF-8 file; dry-run sizes and expected hash prefix |
-| `save_evidence` | Save capture/ROI to Host evidence directory |
 | `list_targets` | Configured endpoints and active Target |
 | `select_target` *(hidden with one endpoint)* | Ping before switching; keep old connection if unreachable |
 | `set_input_lock` | Refuse HID tools; unlock requires `confirm="UNLOCK"` |
@@ -197,7 +202,6 @@ transfer no longer offer server-side `verify` parameters.
 | `SHKVM_TARGETS` | Named endpoint JSON, e.g. `{"target1":"127.0.0.1:9329","target2":"127.0.0.1:9331"}` |
 | `SHKVM_TARGETS_CONFIG` | Shared `%LOCALAPPDATA%/serial-hid-kvm/targets.json`; only endpoints read |
 | `SHKVM_CAPTURE_LOG_DIR` | Platform capture cache; empty disables |
-| `SHKVM_EVIDENCE_DIR` | `~/Documents/kvm-evidence` on Windows, `~/kvm-evidence` elsewhere; empty disables |
 | `SHKVM_HIDDEN_TOOLS` | Comma-separated override; `none` exposes all retained tools |
 | `SHKVM_RUNTIME_CONFIG` | Runtime JSON; falls back to `MCP_SERIAL_HID_KVM_RUNTIME_CONFIG`, then platform user directory |
 | `SHKVM_RT_<KEY>` | Runtime overrides, e.g. `WAIT_POLL_MS`, `SCREEN_STABLE_FRAMES`, `SCREEN_STABLE_THRESHOLD` |
@@ -211,10 +215,18 @@ Successful `select_target` resets baseline, regions, stability history, screen
 size, cursor and shell hints. Suspended waits return `context_changed`; restart
 after capturing the intended Target. Failed candidate ping keeps the current
 client and all state. The input lock persists across switches and allows capture,
-all state tools, health and evidence. One MCP process has one active Target;
+all state tools and health. One MCP process has one active Target;
 separate processes provide independent contexts.
 
 ## Migration / breaking changes
+
+`save_evidence` was removed from registration and dispatch, along with its
+dedicated implementation and `SHKVM_EVIDENCE_DIR` configuration. Existing values
+of that environment variable are ignored. Action `after` returns an image in
+the MCP response and does not save it to disk. No replacement evidence tool is
+provided. Update both editable repositories before restarting MCP: the lower
+`serial-hid-kvm` client now retries only read-only requests after connection loss;
+HID requests are never replayed automatically.
 
 Removed from registration **and dispatch**, including hidden calls:
 `get_screen_text`, `get_screen_text_compact`, `detect_text_elements`, `click_text`,

@@ -303,7 +303,7 @@ def test_config_select_target_visibility_from_env(monkeypatch, targets, hidden):
 def test_tool_definitions_are_compact():
     tools = {t.name: t for t in asyncio.run(srv._all_tools())}
     size = len(json.dumps(tools["type_text"].model_dump(exclude_none=True)))
-    assert size < 1500
+    assert size < 4500  # includes shared after wait/capture options
     assert "ime_off" in tools["type_text"].inputSchema["properties"]
     assert {"region", "zoom", "max_width", "grid"} <= \
         tools["capture_screen"].inputSchema["properties"].keys()

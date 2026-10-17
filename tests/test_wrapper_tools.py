@@ -5,21 +5,8 @@ These cover configuration, Unicode transfer and input locks without hardware.
 
 import os
 
-from PIL import Image
-
 import mcp_serial_hid_kvm.server as srv
 from mcp_serial_hid_kvm.runtime_config import DEFAULTS, RuntimeConfig
-
-
-def test_crop_region_clamps_bounds():
-    img = Image.new("RGB", (100, 100), "white")
-    cropped = srv._crop_region(img, [90, 90, 50, 50])
-    assert cropped.size == (10, 10)
-
-
-def test_crop_region_none_returns_same():
-    img = Image.new("RGB", (100, 100), "white")
-    assert srv._crop_region(img, None) is img
 
 
 # --- V2: cursor tracking ---------------------------------------------------
@@ -188,21 +175,6 @@ def test_paste_unicode_estimate_seconds_normal_timing():
     assert srv._paste_unicode_estimate_seconds(1000, 20, 20) == 40.0
 
 
-# --- ops tools: save_evidence label sanitizing ------------------------------
-
-def test_sanitize_label_keeps_safe_chars():
-    assert srv._sanitize_label("INC51031_F56-ST22") == "INC51031_F56-ST22"
-
-
-def test_sanitize_label_replaces_unsafe_runs():
-    assert srv._sanitize_label("INC 51031/F56:ST22 ") == "INC_51031_F56_ST22"
-
-
-def test_sanitize_label_empty_inputs():
-    assert srv._sanitize_label(None) == ""
-    assert srv._sanitize_label("///") == ""
-
-
 # --- ops tools: transfer_unicode_file command building -----------------------
 
 def test_transfer_commands_are_pure_ascii():
@@ -268,7 +240,7 @@ def test_input_lock_blocks_input_tools_only():
         # Read-only tools stay available.
         assert srv._check_input_lock("get_changed_regions", {}) is None
         assert srv._check_input_lock("health", {}) is None
-        assert srv._check_input_lock("save_evidence", {}) is None
+        assert srv._check_input_lock("capture_screen", {}) is None
     finally:
         _reset_lock()
 
