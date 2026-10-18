@@ -373,3 +373,24 @@ def test_unreachable_server_sends_nothing(monkeypatch):
     result = reply("mouse_click", x=1, y=2)
     assert result["error"] == "kvm_unreachable"
     assert result["sent"] is False and result["retry_safe"] is True
+
+
+def test_server_down_stays_unreachable_on_later_calls(monkeypatch):
+    dead = Mock()
+    dead.connect.side_effect = ConnectionRefusedError("refused")
+    monkeypatch.setattr(srv, "KvmClient", Mock(return_value=dead))
+    monkeypatch.setattr(srv, "_client", None)
+    for _ in range(2):
+        result = reply("mouse_click", x=1, y=2)
+        assert result["error"] == "kvm_unreachable" and result["sent"] is False
+    assert srv._client is None
+    dead.mouse_click.assert_not_called()
+
+
+def test_dropped_connection_reconnects_before_input(client, sleeps):
+    client.connected = False
+    client.connect.side_effect = ConnectionRefusedError("refused")
+    result = reply("type_text", text="abc")
+    assert result["error"] == "kvm_unreachable" and result["sent"] is False
+    client.type_text.assert_not_called()
+    client.send_key.assert_not_called()

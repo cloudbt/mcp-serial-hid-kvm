@@ -112,8 +112,9 @@ def _error_reply(name: str, error: str, exc: Exception) -> list[TextContent]:
 def get_client() -> KvmClient:
     global _client
     if _client is None:
-        _client = KvmClient(_current_target["host"], _current_target["port"])
-        _client.connect()
+        client = KvmClient(_current_target["host"], _current_target["port"])
+        client.connect()  # keep no half-made client when the server is down
+        _client = client
         logger.info(f"Connected to KVM server ({_current_target['name']})")
         # Push effective HID timing so the original + wrapper tools honor config.
         _apply_hardware_timing(_client)
@@ -1824,6 +1825,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             return _json_reply({"ok": False, "tool": name, "error": "unknown_tool"})
         try:
             client = get_client()
+            # A failed request drops the socket. Reconnect here, before any
+            # input, so a server that is down reads as nothing sent.
+            if not client.connected:
+                client.connect()
         except (OSError, KvmClientError) as e:
             return _error_reply(name, "kvm_unreachable", e)
 
