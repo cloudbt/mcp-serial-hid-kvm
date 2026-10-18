@@ -108,7 +108,7 @@ The calling model must inspect the final capture.
 
 ## Available tools
 
-31 tools are callable; 25 are advertised by default (24 when only one Target
+30 tools are callable; 24 are advertised by default (23 when only one Target
 endpoint is configured). Tools marked hidden are setup or rarely used tuning/state
 tools; hidden tools remain callable. `select_target` is hidden by default only when
 the configured targets resolve to a single endpoint. `SHKVM_HIDDEN_TOOLS` replaces
@@ -138,7 +138,6 @@ exposed or invoked.
 | `set_capture_resolution` *(hidden)* | Request resolution; invalidate image state on success |
 | `open_shell` | HID shell launch only; `verified=false`, calling model verifies focus |
 | `paste_unicode_text` | Base64URL → Target clipboard; dry-run sizes, SHA-256 and timing estimate |
-| `transfer_unicode_file` | Chunked Base64URL → Target UTF-8 file; dry-run sizes and expected hash prefix |
 | `list_targets` | Configured endpoints and active Target |
 | `select_target` *(hidden with one endpoint)* | Ping before switching; keep old connection if unreachable |
 | `set_input_lock` | Refuse HID tools; unlock requires `confirm="UNLOCK"` |
@@ -233,14 +232,13 @@ character; kana and ASCII are faster.
 Payloads are encoded on the Host and typed into Target PowerShell. Temporary
 hardware timing is restored in `finally`; `dry_run=true` never sends input.
 Clipboard results report `clipboard_requested=true, set_clipboard=null,
-verified=false`; file results report `write_requested=true, written=null,
 verified=false`. Delivery attempts do not claim target execution or verification.
 The Target still echoes a marker/hash prefix for the calling model to inspect.
 
 Automatic paste was removed: legacy `paste_after_set=true` returns
 `vision_verification_required` before HID input. Capture and verify the clipboard
-operation and intended field, then send Ctrl+V separately. `open_shell` and file
-transfer no longer offer server-side `verify` parameters.
+operation and intended field, then send Ctrl+V separately. `open_shell` no longer
+offers a server-side `verify` parameter.
 
 ## Configuration and multiple Targets
 
@@ -289,6 +287,10 @@ Removed from registration **and dispatch**, including hidden calls:
 `wait_for_text`, `get_terminal_output`, `execute_and_read`, `run_powershell_and_read`,
 `run_wsl_and_read`, `run_powershell_until_done`, `run_task_and_report`.
 Use capture + Vision interpretation and explicit HID.
+
+`transfer_unicode_file` was removed the same way: type Japanese or Chinese
+with `type_japanese` / `type_chinese` (and save from an editor when a file is
+needed), or use `paste_unicode_text`.
 
 Health no longer returns a text-engine status field. Language/terminal settings
 and the old PIL diff tuning key were removed. Unicode and shell verification

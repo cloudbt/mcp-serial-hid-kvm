@@ -660,7 +660,7 @@ async def _do_paste_unicode_text(
             "error": "command_too_long",
             "command_chars": len(command),
             "max_command_chars": _PASTE_CMD_MAX,
-            "detail": "Use transfer_unicode_file for large texts.",
+            "detail": "Split the text into several calls, or type it with type_japanese/type_chinese.",
         }
 
     sha256 = hashlib.sha256(utf8_bytes).hexdigest()
@@ -749,12 +749,12 @@ async def _do_paste_unicode_text(
 INPUT_TOOLS = {
     "type_text", "send_key",
     "mouse_move", "mouse_click", "mouse_drag", "mouse_scroll",
-    "open_shell", "paste_unicode_text", "transfer_unicode_file",
+    "open_shell", "paste_unicode_text",
     "type_japanese", "type_chinese",
 }
 
 # Input tools whose dry_run sends nothing.
-_DRY_RUN_TOOLS = ("paste_unicode_text", "transfer_unicode_file", "type_japanese", "type_chinese")
+_DRY_RUN_TOOLS = ("paste_unicode_text", "type_japanese", "type_chinese")
 _IME_LANGUAGE = {"type_japanese": "japanese", "type_chinese": "chinese"}
 
 
@@ -856,157 +856,6 @@ def _do_list_targets() -> dict:
         "current": dict(_current_target),
         "connected": _client is not None,
         "input_locked": _input_lock is not None,
-    }
-
-
-# ---------------------------------------------------------------------------
-# transfer_unicode_file helpers
-# ---------------------------------------------------------------------------
-
-_TRANSFER_TMP_EXPR = "(Join-Path $env:TEMP 'kvm_xfer.b64')"
-_TRANSFER_DEFAULT_CHUNK = 2500
-
-
-def _ps_quote_single(s: str) -> str:
-    """Escape a string for a PowerShell single-quoted literal."""
-    return s.replace("'", "''")
-
-
-def _transfer_build_commands(text: str, target_path: str,
-                             chunk_chars: int = _TRANSFER_DEFAULT_CHUNK):
-    """Build the PowerShell command sequence that writes *text* (UTF-8, no BOM)
-    to *target_path* via chunked Base64URL typed into a temp file.
-
-    Returns ``(init_cmd, chunk_cmds, final_cmd, sha256_12, payload_chars,
-    utf8_bytes)``. All commands are pure ASCII. sha256_12 is the uppercase
-    12-hex-char prefix that the final command echoes for verification.
-    """
-    utf8 = text.encode("utf-8")
-    payload = base64.urlsafe_b64encode(utf8).decode("ascii").rstrip("=")
-    chunk_chars = max(100, int(chunk_chars))
-    chunks = [payload[i:i + chunk_chars] for i in range(0, len(payload), chunk_chars)]
-    dest = _ps_quote_single(target_path)
-    init_cmd = f"Set-Content -LiteralPath {_TRANSFER_TMP_EXPR} -Value '' -NoNewline"
-    chunk_cmds = [
-        f"Add-Content -LiteralPath {_TRANSFER_TMP_EXPR} -Value '{c}' -NoNewline"
-        for c in chunks
-    ]
-    sha256_12 = hashlib.sha256(utf8).hexdigest()[:12].upper()
-    final_cmd = (
-        f"$p={_TRANSFER_TMP_EXPR};"
-        "$b=(Get-Content -LiteralPath $p -Raw);"
-        "$b=$b.Replace('-','+').Replace('_','/');"
-        "while($b.Length%4){$b+='='};"
-        "$y=[Convert]::FromBase64String($b);"
-        f"[IO.File]::WriteAllBytes('{dest}',$y);"
-        "Remove-Item -LiteralPath $p;"
-        f"$h=(Get-FileHash -LiteralPath '{dest}' -Algorithm SHA256).Hash.Substring(0,12);"
-        "Write-Output ('XF'+'ER_OK '+$h+' bytes='+$y.Length)"
-    )
-    return init_cmd, chunk_cmds, final_cmd, sha256_12, len(payload), len(utf8)
-
-
-async def _do_transfer_unicode_file(
-    client: KvmClient,
-    *,
-    text: str,
-    target_path: str,
-    chunk_chars: int = _TRANSFER_DEFAULT_CHUNK,
-    focus_shell: bool = True,
-    wait_seconds: float = 2.0,
-    fast_timing: bool = True,
-    type_key_ms: int = 5,
-    type_inter_key_ms: int = 5,
-    type_shift_ms: int = 0,
-    max_text_chars: int = 8000,
-    dry_run: bool = False,
-) -> dict:
-    """Write Unicode text to a file on the target via chunked Base64 typing."""
-    if not text:
-        return {"ok": False, "error": "empty_text"}
-    if len(text) > max_text_chars:
-        return {"ok": False, "error": "text_too_long",
-                "text_chars": len(text), "max_text_chars": max_text_chars}
-    try:
-        validate_chars(target_path)
-    except Exception as e:
-        return {"ok": False, "error": "bad_target_path", "detail": str(e)}
-
-    init_cmd, chunk_cmds, final_cmd, sha256_12, payload_chars, utf8_bytes = \
-        _transfer_build_commands(text, target_path, chunk_chars)
-    all_cmds = [init_cmd, *chunk_cmds, final_cmd]
-    for cmd in all_cmds:
-        validate_chars(cmd)
-
-    cfg = get_config()
-    eff_key_ms = type_key_ms if fast_timing else cfg.get("type_key_ms")
-    eff_inter_ms = type_inter_key_ms if fast_timing else cfg.get("type_inter_key_ms")
-    total_chars = sum(len(c) for c in all_cmds)
-    estimated_s = _paste_unicode_estimate_seconds(total_chars, eff_key_ms, eff_inter_ms)
-
-    meta: dict = {
-        "text_chars": len(text),
-        "utf8_bytes": utf8_bytes,
-        "payload_chars": payload_chars,
-        "chunks": len(chunk_cmds),
-        "sha256_12": sha256_12,
-        "target_path": target_path,
-        "estimated_type_seconds": estimated_s,
-    }
-
-    if dry_run:
-        return {"ok": True, "dry_run": True, "written": False, "verified": False,
-                **meta}
-
-    if focus_shell:
-        await _do_open_shell(client, shell="powershell")
-
-    old_timing = None
-    warnings: list[str] = []
-    if fast_timing:
-        try:
-            old_timing = client.get_timing()
-            client.set_timing({
-                "char_delay": type_inter_key_ms / 1000.0,
-                "type_key_hold": type_key_ms / 1000.0,
-                "type_shift": type_shift_ms / 1000.0,
-            })
-        except KvmClientError as e:
-            warnings.append(f"fast_timing not applied: {e}")
-            old_timing = None
-
-    verified_marker = False
-    verified_hash = False
-    try:
-        client.send_key("0x91")
-        await asyncio.sleep(0.15)
-        for i, cmd in enumerate(all_cmds):
-            _clear_input_line(client)
-            await asyncio.sleep(0.05)
-            client.type_text(cmd, raw=True)
-            await asyncio.sleep(0.1)
-            client.send_key("enter")
-            # Final command decodes + hashes; give it the longer wait.
-            await asyncio.sleep(
-                max(0.0, min(wait_seconds, _hard_max_wait()))
-                if i == len(all_cmds) - 1 else 0.15)
-
-    finally:
-        if old_timing is not None:
-            try:
-                client.set_timing(old_timing)
-            except KvmClientError as e:
-                warnings.append(f"timing restore failed: {e}")
-
-    return {
-        "ok": True,
-        "written": None,
-        "write_requested": True,
-        "verification": "calling_model_required",
-        "verified": verified_hash,
-        "verified_marker": verified_marker,
-        **meta,
-        "warning": "; ".join(warnings) if warnings else None,
     }
 
 
@@ -1608,8 +1457,8 @@ async def _all_tools() -> list[Tool]:
             name="paste_unicode_text",
             description=(
                 "Put Unicode text (Japanese, Chinese, ...) on the Target clipboard by typing a Base64 "
-                "PowerShell command. Inspect the result, then send Ctrl+V separately. For files or "
-                ">1000 chars use transfer_unicode_file."
+                "PowerShell command. Inspect the result, then send Ctrl+V separately. Prefer "
+                "type_japanese/type_chinese for typing into a field."
             ),
             inputSchema={
                 "type": "object",
@@ -1654,64 +1503,6 @@ async def _all_tools() -> list[Tool]:
                 "required": ["text"],
             },
         ),
-        Tool(
-            name="transfer_unicode_file",
-            description=(
-                "Write Unicode text to a FILE on the Target as exact UTF-8 (no BOM) via chunked Base64 "
-                "typed into PowerShell; the Target echoes a SHA-256 prefix to check on screen. "
-                "Call with dry_run=true first for the time estimate."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "File content (Unicode OK), written as UTF-8 without BOM.",
-                    },
-                    "target_path": {
-                        "type": "string",
-                        "description": "Absolute ASCII path on the target, e.g. C:\\Temp\\notes.md. Environment variables are NOT expanded.",
-                    },
-                    "chunk_chars": {
-                        "type": "integer",
-                        "description": "Base64 chars per chunk (default 2500, min 100).",
-                    },
-                    "focus_shell": {
-                        "type": "boolean",
-                        "description": "Open a Target PowerShell via Win+R first (default true).",
-                    },
-                    "wait_seconds": {
-                        "type": "number",
-                        "description": "Wait after the final decode command (default 2.0).",
-                    },
-                    "fast_timing": {
-                        "type": "boolean",
-                        "description": "Temporarily speed up HID typing, then restore (default true).",
-                    },
-                    "type_key_ms": {
-                        "type": "integer",
-                        "description": "Key hold ms with fast_timing (default 5).",
-                    },
-                    "type_inter_key_ms": {
-                        "type": "integer",
-                        "description": "Inter-key delay ms with fast_timing (default 5).",
-                    },
-                    "type_shift_ms": {
-                        "type": "integer",
-                        "description": "Modifier delay ms with fast_timing (default 0).",
-                    },
-                    "max_text_chars": {
-                        "type": "integer",
-                        "description": "Safety cap on characters (default 8000; takes minutes over HID).",
-                    },
-                    "dry_run": {
-                        "type": "boolean",
-                        "description": "Only return sizes, chunk count and time estimate; no input (default false).",
-                    },
-                },
-                "required": ["text", "target_path"],
-            },
-        ),
         # -------------------------------------------------------------------
         # Ops tools: multi-target,
         # production interlock.
@@ -1753,7 +1544,7 @@ async def _all_tools() -> list[Tool]:
         Tool(
             name="set_input_lock",
             description=(
-                "Production interlock: when locked, every HID input tool (keyboard, mouse, shell, paste/transfer) "
+                "Production interlock: when locked, every HID input tool (keyboard, mouse, shell, paste, IME typing) "
                 "is refused with error=input_locked; capture, image-state and health stay available. "
                 "Unlocking requires confirm='UNLOCK'. In-memory only (cleared on MCP restart)."
             ),
@@ -2036,23 +1827,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 type_inter_key_ms=int(arguments.get("type_inter_key_ms", 5)),
                 type_shift_ms=int(arguments.get("type_shift_ms", 0)),
                 max_text_chars=int(arguments.get("max_text_chars", 1200)),
-                dry_run=arguments.get("dry_run", False),
-            )
-            return _json_reply(result)
-
-        elif name == "transfer_unicode_file":
-            result = await _do_transfer_unicode_file(
-                client,
-                text=arguments["text"],
-                target_path=arguments["target_path"],
-                chunk_chars=int(arguments.get("chunk_chars", _TRANSFER_DEFAULT_CHUNK)),
-                focus_shell=arguments.get("focus_shell", True),
-                wait_seconds=float(arguments.get("wait_seconds", 2.0)),
-                fast_timing=arguments.get("fast_timing", True),
-                type_key_ms=int(arguments.get("type_key_ms", 5)),
-                type_inter_key_ms=int(arguments.get("type_inter_key_ms", 5)),
-                type_shift_ms=int(arguments.get("type_shift_ms", 0)),
-                max_text_chars=int(arguments.get("max_text_chars", 8000)),
                 dry_run=arguments.get("dry_run", False),
             )
             return _json_reply(result)
