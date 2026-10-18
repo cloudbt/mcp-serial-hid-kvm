@@ -91,7 +91,7 @@ capture_screen (also stores the full capture as the pre-action baseline)
 
 For `mouse_scroll`, `mouse_click`, `send_key` and `type_text`, an optional
 `after` combines action → optional cursor parking → wait → screenshot in one
-MCP call. Omitting `after` preserves the original text-only result. See
+MCP call. Omitting `after` returns only the JSON action result. See
 [action observation options, stage results and timing](docs/action-after.md).
 
 Capture before acting: `auto_baseline=true` seeds a missing baseline from the
@@ -116,7 +116,7 @@ exposed or invoked.
 
 | Tool | Purpose |
 |---|---|
-| `type_text` | ASCII HID, inline tags, optional raw mode; actual newlines press Enter; `ime_off=true` sends HID `0x91` first |
+| `type_text` | ASCII HID, inline tags, optional raw mode; actual newlines press Enter; sends HID `0x91` (IME off) first unless `ime_off=false` (default from runtime `type_ime_off_default`, true) |
 | `send_key` | One HID key with optional modifiers |
 | `mouse_move` | Absolute/relative HID cursor movement |
 | `mouse_click` | Optional coordinate and button; `count` 1–3 for double/triple click |
@@ -151,10 +151,32 @@ in **HID coordinates**, so a label can be passed to `mouse_click` directly. The
 baseline is always the full frame. A short JSON text follows the image:
 
 ```json
-{"capture": "1920x1080", "hid": "1920x1080", "image": "600x300",
+{"ok": true, "capture": "1920x1080", "hid": "1920x1080", "image": "600x300",
  "region": [100, 200, 300, 150], "scale": 2,
  "to_hid": "hid_x = 100 + image_x * 0.5; hid_y = 200 + image_y * 0.5"}
 ```
+
+### Result format
+
+Every text result is one JSON object with `ok`. Images, when returned, come
+alongside it. Successful input tools return
+`{"ok": true, "tool": ..., "sent": true, "message": ...}`; `sent` means the HID
+requests were acknowledged, not that the UI reacted. Failures return
+`{"ok": false, "tool": ..., "error": ..., "detail": ..., "retry_safe": ...}`:
+
+| `error` | Meaning |
+|---|---|
+| `invalid_arguments` | Rejected before any input |
+| `kvm_unreachable` | No connection to the hardware server; nothing sent |
+| `kvm_error` | The hardware server or transport failed |
+| `unknown_tool` | Removed or misspelled tool name |
+| `internal_error` | Unexpected MCP server failure |
+
+Input tools (and `advance_file_copy`) add `sent`: `false` when the failure
+happened before the first HID request, `null` when input may have been partly
+delivered. `retry_safe=false` means capture and inspect the screen before
+resending; never replay blindly. `health` keeps its own meaning of `ok`
+(readiness of API, serial and video).
 
 ### Image-state parameters
 
@@ -227,6 +249,14 @@ the MCP response and does not save it to disk. No replacement evidence tool is
 provided. Update both editable repositories before restarting MCP: the lower
 `serial-hid-kvm` client now retries only read-only requests after connection loss;
 HID requests are never replayed automatically.
+
+Tool results are now always JSON (see [Result format](#result-format)): plain
+messages such as `Typed 5 characters` moved into `message`, and failures that
+used to read `Error: ...` or `Unknown tool: ...` now carry `error` codes.
+`list_capture_devices` returns `{"devices": []}` instead of a sentence when
+none are found. `type_text` now turns the IME off first by default; set
+`type_ime_off_default=false` (runtime config) or pass `ime_off=false` to keep
+the previous behavior.
 
 Removed from registration **and dispatch**, including hidden calls:
 `get_screen_text`, `get_screen_text_compact`, `detect_text_elements`, `click_text`,

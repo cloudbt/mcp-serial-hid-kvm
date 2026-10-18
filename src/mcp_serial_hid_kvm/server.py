@@ -80,6 +80,30 @@ def _hard_max_wait() -> float:
     return float(get_config().get("max_wait_seconds"))
 
 
+def _json_reply(result: dict) -> list[TextContent]:
+    """Every text result is one JSON object carrying ``ok`` (true unless set)."""
+    if "ok" not in result:
+        result = {"ok": True, **result}
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+
+def _error_reply(name: str, error: str, exc: Exception) -> list[TextContent]:
+    """Failure as JSON. For input tools, say whether HID input may have gone out.
+
+    Argument validation and an unreachable server fail before the first HID
+    request (sent=false). Any other failure can follow partial delivery
+    (sent=null): observe the screen before resending, never replay blindly.
+    """
+    result = {"ok": False, "tool": name, "error": error, "detail": str(exc)}
+    if name in INPUT_TOOLS | {"advance_file_copy"}:
+        sent = False if error in ("invalid_arguments", "kvm_unreachable") else None
+        result["sent"] = sent
+        result["retry_safe"] = sent is False
+    else:
+        result["retry_safe"] = True
+    return _json_reply(result)
+
+
 # ---------------------------------------------------------------------------
 # Wrapper-tool helpers (pure logic, unit-testable without hardware)
 # ---------------------------------------------------------------------------
@@ -88,8 +112,9 @@ def _hard_max_wait() -> float:
 def get_client() -> KvmClient:
     global _client
     if _client is None:
-        _client = KvmClient(_current_target["host"], _current_target["port"])
-        _client.connect()
+        client = KvmClient(_current_target["host"], _current_target["port"])
+        client.connect()  # keep no half-made client when the server is down
+        _client = client
         logger.info(f"Connected to KVM server ({_current_target['name']})")
         # Push effective HID timing so the original + wrapper tools honor config.
         _apply_hardware_timing(_client)
@@ -1027,7 +1052,7 @@ async def _send_action(client, name, arguments, guard=lambda: None):
     guard()
     if name == "type_text":
         text = arguments["text"]
-        if arguments.get("ime_off", False):
+        if arguments.get("ime_off", get_config().get("type_ime_off_default")):
             client.send_key("0x91")
             await asyncio.sleep(0.15)
             guard()
@@ -1228,7 +1253,7 @@ async def _all_tools() -> list[Tool]:
                     },
                     "ime_off": {
                         "type": "boolean",
-                        "description": "First press HID 0x91 (Japanese IME off: half-width alphanumeric), as open_shell does. Default false.",
+                        "description": "First press HID 0x91 (Japanese IME off: half-width alphanumeric), as open_shell does. Default from runtime config type_ime_off_default (true); pass false to keep the current IME state.",
                     },
                     "char_delay_ms": {
                         "type": "integer",
@@ -1761,7 +1786,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         # Production interlock: refuse HID-generating tools while locked.
         lock_error = _check_input_lock(name, arguments or {})
         if lock_error is not None:
-            return [TextContent(type="text", text=json.dumps(lock_error, ensure_ascii=False))]
+            return _json_reply(lock_error)
 
         # Tools that must not depend on a (possibly dead) connection to the
         # currently selected target.
@@ -1770,35 +1795,42 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 locked=bool(arguments["locked"]),
                 reason=arguments.get("reason"),
                 confirm=arguments.get("confirm"))
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+            return _json_reply(result)
 
         elif name == "list_targets":
             result = _do_list_targets()
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+            return _json_reply(result)
 
         elif name == "get_file_copy_status":
-            return [TextContent(type="text", text=json.dumps(_copies.status(arguments["job_id"]), ensure_ascii=False))]
+            return _json_reply(_copies.status(arguments["job_id"]))
         elif name == "cancel_file_copy":
-            return [TextContent(type="text", text=json.dumps(_copies.cancel(arguments["job_id"]), ensure_ascii=False))]
+            return _json_reply(_copies.cancel(arguments["job_id"]))
         elif name == "copy_file_from_target":
             result = _copies.prepare(get_client(), _current_target, **arguments)
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+            return _json_reply(result)
         elif name == "advance_file_copy":
             result = _copies.advance(get_client(), _current_target, **arguments)
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+            return _json_reply(result)
 
         elif name == "select_target":
             result = _do_select_target(
                 name=arguments.get("name"),
                 host=arguments.get("host"),
                 port=arguments.get("port"))
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+            return _json_reply(result)
 
         # Reject removed/unknown tools before opening any hardware connection.
         definitions = {tool.name: tool for tool in await _all_tools()}
         if name not in definitions:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
-        client = get_client()
+            return _json_reply({"ok": False, "tool": name, "error": "unknown_tool"})
+        try:
+            client = get_client()
+            # A failed request drops the socket. Reconnect here, before any
+            # input, so a server that is down reads as nothing sent.
+            if not client.connected:
+                client.connect()
+        except (OSError, KvmClientError) as e:
+            return _error_reply(name, "kvm_unreachable", e)
 
         if name in ACTION_TOOLS:
             _validate_action(name, arguments)
@@ -1806,7 +1838,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 schema = definitions[name].inputSchema["properties"]["after"]
                 return await _action_after(client, name, arguments, schema, started)
             message = await _send_action(client, name, arguments)
-            return [TextContent(type="text", text=message)]
+            return _json_reply({"tool": name, "sent": True, "message": message})
 
         elif name == "mouse_move":
             x = arguments["x"]
@@ -1815,10 +1847,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             client.mouse_move(x, y, relative)
             if relative:
                 _bump_cursor(x, y)
-                return [TextContent(type="text", text=f"Moved mouse by ({x}, {y})")]
+                message = f"Moved mouse by ({x}, {y})"
             else:
                 _set_cursor(x, y)
-                return [TextContent(type="text", text=f"Moved mouse to ({x}, {y})")]
+                message = f"Moved mouse to ({x}, {y})"
+            return _json_reply({"tool": name, "sent": True, "message": message})
 
         elif name == "mouse_drag":
             start_x = arguments["start_x"]
@@ -1837,10 +1870,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 await asyncio.sleep(0.05)
             client.mouse_up(button, end_x, end_y)
             _set_cursor(end_x, end_y)
-            return [TextContent(
-                type="text",
-                text=f"Dragged {button} from ({start_x}, {start_y}) to ({end_x}, {end_y})",
-            )]
+            return _json_reply({
+                "tool": name, "sent": True,
+                "message": f"Dragged {button} from ({start_x}, {start_y}) to ({end_x}, {end_y})"})
 
         elif name == "capture_screen":
             jpeg_bytes, image = _capture_frame()
@@ -1864,16 +1896,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                     data=base64.standard_b64encode(data).decode("utf-8"),
                     mimeType="image/jpeg",
                 ),
-                TextContent(type="text", text=json.dumps(meta)),
+                *_json_reply(meta),
             ]
 
 
         elif name == "get_device_info":
-            info = client.get_device_info()
-            return [TextContent(
-                type="text",
-                text=json.dumps(info, indent=2, ensure_ascii=False),
-            )]
+            return _json_reply(client.get_device_info())
 
         elif name == "set_capture_resolution":
             width = arguments["width"]
@@ -1881,46 +1909,40 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             result = client.set_capture_resolution(width, height)
             _state.reset()
             cap_info = result.get("info", {})
-            return [TextContent(
-                type="text",
-                text=f"Resolution set: {cap_info.get('width')}x{cap_info.get('height')} (requested {width}x{height})",
-            )]
+            return _json_reply({
+                "tool": name, "width": cap_info.get("width"), "height": cap_info.get("height"),
+                "requested": {"width": width, "height": height},
+                "message": f"Resolution set: {cap_info.get('width')}x{cap_info.get('height')} (requested {width}x{height})"})
 
         elif name == "list_capture_devices":
             result = client.list_capture_devices()
-            devices = result.get("devices", [])
-            if not devices:
-                return [TextContent(type="text", text="No capture devices found.")]
-            return [TextContent(
-                type="text",
-                text=json.dumps(devices, indent=2, ensure_ascii=False),
-            )]
+            return _json_reply({"tool": name, "devices": result.get("devices", [])})
 
         elif name == "set_capture_device":
             device = arguments["device"]
             result = client.set_capture_device(device)
             _state.reset()
             cap_info = result.get("info", {})
-            return [TextContent(
-                type="text",
-                text=f"Switched to device {device}: {cap_info.get('width')}x{cap_info.get('height')} ({cap_info.get('backend')})",
-            )]
+            return _json_reply({
+                "tool": name, "device": device, "width": cap_info.get("width"),
+                "height": cap_info.get("height"), "backend": cap_info.get("backend"),
+                "message": f"Switched to device {device}: {cap_info.get('width')}x{cap_info.get('height')} ({cap_info.get('backend')})"})
 
         elif name == "health":
             result = _do_health(client)
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+            return _json_reply(result)
 
         elif name == "set_screen_baseline":
             result = _state.set_baseline(_capture_image(), arguments.get("region"))
             result["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
-            return [TextContent(type="text", text=json.dumps(result))]
+            return _json_reply(result)
 
         elif name == "get_changed_regions":
             result = _state.observe(
                 _capture_image(), threshold=arguments.get("threshold", get_config().get("screen_change_threshold")),
                 region=arguments.get("region"), min_changed_area=arguments.get("min_changed_area"),
                 auto_baseline=arguments.get("auto_baseline", False))
-            return [TextContent(type="text", text=json.dumps(result))]
+            return _json_reply(result)
 
         elif name in ("wait_for_change", "wait_for_stable"):
             if name == "wait_for_stable":
@@ -1939,14 +1961,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 StateEngine._wait_args(kwargs["timeout_seconds"], kwargs["poll_ms"], kwargs["threshold"])
                 kwargs["timeout_seconds"] = min(kwargs["timeout_seconds"], _hard_max_wait())
                 result = await _state.wait_for_change(_capture_image, **kwargs)
-            return [TextContent(type="text", text=json.dumps(result))]
+            return _json_reply(result)
 
         elif name == "open_shell":
             result = await _do_open_shell(
                 client, shell=arguments.get("shell", "powershell"),
                 distro=arguments.get("distro"), method=arguments.get("method", "win_r"),
                 wait_seconds=arguments.get("wait_seconds"))
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+            return _json_reply(result)
 
 
         elif name == "cursor_crop":
@@ -1956,10 +1978,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 draw_crosshair=arguments.get("draw_crosshair", True),
                 quality=arguments.get("quality", 85))
             if img_bytes is None:
-                return [TextContent(type="text", text=json.dumps(meta, ensure_ascii=False))]
+                return _json_reply(meta)
             b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
             return [
-                TextContent(type="text", text=json.dumps(meta, ensure_ascii=False)),
+                *_json_reply(meta),
                 ImageContent(type="image", data=b64, mimeType="image/jpeg"),
             ]
 
@@ -1973,11 +1995,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             for key in list(args.keys()):
                 values[key] = args.pop(key)
             result = _do_configure(client, values=values, reset=reset, persist=persist)
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+            return _json_reply(result)
 
         elif name == "get_timing":
             result = _do_get_timing(client, include_source=arguments.get("include_source", True))
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+            return _json_reply(result)
 
         elif name == "paste_unicode_text":
             result = await _do_paste_unicode_text(
@@ -1994,7 +2016,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 max_text_chars=int(arguments.get("max_text_chars", 1200)),
                 dry_run=arguments.get("dry_run", False),
             )
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+            return _json_reply(result)
 
         elif name == "transfer_unicode_file":
             result = await _do_transfer_unicode_file(
@@ -2011,17 +2033,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 max_text_chars=int(arguments.get("max_text_chars", 8000)),
                 dry_run=arguments.get("dry_run", False),
             )
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+            return _json_reply(result)
 
         else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+            return _json_reply({"ok": False, "tool": name, "error": "unknown_tool"})
 
     except KvmClientError as e:
         logger.error(f"KVM server error in tool {name}: {e}")
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
+        return _error_reply(name, "kvm_error", e)
+    except ValueError as e:
+        return _error_reply(name, "invalid_arguments", e)
     except Exception as e:
         logger.exception(f"Error in tool {name}")
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
+        return _error_reply(name, "internal_error", e)
 
 
 async def run():

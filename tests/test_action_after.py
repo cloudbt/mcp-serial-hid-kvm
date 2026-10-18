@@ -72,7 +72,8 @@ def call(name="mouse_scroll", **arguments):
 def test_legacy_and_after_for_all_actions(context, name, args, method, text):
     client, _ = context
     legacy = asyncio.run(srv.call_tool(name, args))
-    assert len(legacy) == 1 and legacy[0].text == text
+    assert len(legacy) == 1
+    assert json.loads(legacy[0].text) == {"ok": True, "tool": name, "sent": True, "message": text}
     client.capture_frame_jpeg.assert_not_called()
     client.reset_mock()
     content, result = call(name, **args, after={"wait": {"mode": "none"}})
@@ -261,7 +262,8 @@ def test_action_transport_error_is_unknown_and_never_replayed(context):
 def test_invalid_after_sends_no_input(context, after):
     client, _ = context
     content = asyncio.run(srv.call_tool("type_text", {"text": "hello", "ime_off": True, "after": after}))
-    assert content[0].text.startswith("Error:")
+    result = json.loads(content[0].text)
+    assert result["error"] == "invalid_arguments" and result["sent"] is False
     client.send_key.assert_not_called()
     client.type_text.assert_not_called()
     client.mouse_move.assert_not_called()
@@ -273,7 +275,9 @@ def test_invalid_after_sends_no_input(context, after):
 def test_invalid_action_sends_no_input(context, name, args):
     client, _ = context
     content = asyncio.run(srv.call_tool(name, {**args, "after": {}}))
-    assert content[0].text.startswith("Error:") and not client.method_calls
+    result = json.loads(content[0].text)
+    assert result["error"] == "invalid_arguments" and result["sent"] is False
+    assert result["retry_safe"] is True and not client.method_calls
 
 
 @pytest.mark.parametrize("refusal", ["input_locked", "file_copy_owns_input"])
@@ -361,7 +365,7 @@ def test_real_context_switch_during_wait_is_invalidated(context, monkeypatch, ki
             assert srv._do_select_target(host="fake-next", port=12345)["ok"]
         else:
             reply = await srv.call_tool("set_capture_resolution", {"width": 320, "height": 240})
-            assert not reply[0].text.startswith("Error:")
+            assert json.loads(reply[0].text)["ok"]
 
     clock.on_sleep = switch
     content, result = call(after={"wait": {"mode": mode, **({"seconds": .2} if mode == "delay" else {})}})
@@ -456,7 +460,7 @@ def tcp_peer():
 
 
 @pytest.mark.parametrize("name,args", [("mouse_scroll", {"amount": -1}),
-    ("mouse_click", {}), ("send_key", {"key": "enter"}), ("type_text", {"text": "abc"})])
+    ("mouse_click", {}), ("send_key", {"key": "enter"}), ("type_text", {"text": "abc", "ime_off": False})])
 @pytest.mark.parametrize("failure", ["eof", "malformed"])
 def test_tcp_response_loss_integration_never_replays_input(context, monkeypatch, tcp_peer, name, args, failure):
     client, requests, failures = tcp_peer

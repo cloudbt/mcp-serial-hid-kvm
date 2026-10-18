@@ -65,8 +65,17 @@ def run(name, **arguments):
     return asyncio.run(srv.call_tool(name, arguments))
 
 
+def reply(name, **arguments):
+    return json.loads(run(name, **arguments)[0].text)
+
+
 def text(name, **arguments):
-    return run(name, **arguments)[0].text
+    """An action's message, a failure's detail, else the raw JSON text."""
+    raw = run(name, **arguments)[0].text
+    result = json.loads(raw)
+    if "message" in result:
+        return result["message"]
+    return result["detail"] if "error" in result and "detail" in result else raw
 
 
 def capture(**arguments):
@@ -108,7 +117,7 @@ def test_capture_untransformed_returns_kvm_jpeg_and_metadata(client):
     image, data, meta = capture()
     assert data == client.capture_frame_jpeg.return_value[0]  # no re-encoding
     assert image.size == (1920, 1080)
-    assert meta == {"capture": "1920x1080", "hid": "1920x1080", "image": "1920x1080",
+    assert meta == {"ok": True, "capture": "1920x1080", "hid": "1920x1080", "image": "1920x1080",
                     "region": [0, 0, 1920, 1080], "scale": 1,
                     "to_hid": "hid_x = 0 + image_x * 1; hid_y = 0 + image_y * 1"}
     assert srv._state.baseline.shape[:2] == (1080, 1920)
@@ -170,7 +179,9 @@ def test_capture_grid_draws_hid_labelled_lines(client):
 ])
 def test_capture_invalid_options_do_not_touch_baseline(client, arguments, message):
     result = run("capture_screen", **arguments)
-    assert result[0].type == "text" and message in result[0].text
+    assert len(result) == 1 and result[0].type == "text"
+    error = json.loads(result[0].text)
+    assert error["error"] == "invalid_arguments" and message in error["detail"]
     assert srv._state.baseline is None
 
 
@@ -239,14 +250,29 @@ def test_type_text_ime_off_sends_0x91_first(client, sleeps):
     client.send_key.assert_called_once_with("0x91")
 
 
-def test_type_text_default_sends_no_ime_key(client, sleeps):
-    text("type_text", text="abc")
+def test_type_text_default_turns_ime_off_first(client, sleeps):
+    assert text("type_text", text="abc") == "Typed 3 characters"
+    assert [c[0] for c in client.method_calls] == ["send_key", "type_text"]
+    client.send_key.assert_called_once_with("0x91")
+
+
+def test_type_text_ime_off_false_sends_no_ime_key(client, sleeps):
+    text("type_text", text="abc", ime_off=False)
     client.send_key.assert_not_called()
     client.type_text.assert_called_once_with("abc", None, raw=False)
 
 
+def test_type_text_ime_default_follows_runtime_config(client, sleeps):
+    srv.get_config().update({"type_ime_off_default": False})
+    text("type_text", text="abc")
+    client.send_key.assert_not_called()
+    assert text("type_text", text="abc", ime_off=True) == "Typed 3 characters"
+    client.send_key.assert_called_once_with("0x91")
+
+
 def test_type_text_invalid_chars_send_nothing(client, sleeps):
-    assert text("type_text", text="日本", ime_off=True).startswith("Error")
+    result = reply("type_text", text="日本", ime_off=True)
+    assert result["error"] == "invalid_arguments" and result["sent"] is False
     assert not client.method_calls
 
 
@@ -256,7 +282,7 @@ def test_removed_tools_are_unknown(client):
     names = {t.name for t in asyncio.run(srv._all_tools())}
     for name in ("screen_changed", "wait_for_screen_change", "send_key_sequence"):
         assert name not in names
-        assert text(name) == f"Unknown tool: {name}"
+        assert reply(name) == {"ok": False, "tool": name, "error": "unknown_tool"}
     assert not client.method_calls
 
 
@@ -307,3 +333,64 @@ def test_tool_definitions_are_compact():
     assert "ime_off" in tools["type_text"].inputSchema["properties"]
     assert {"region", "zoom", "max_width", "grid"} <= \
         tools["capture_screen"].inputSchema["properties"].keys()
+
+
+# --- 6. uniform JSON results ------------------------------------------------------------
+
+@pytest.mark.parametrize("name,arguments", [
+    ("mouse_move", {"x": 5, "y": 6}),
+    ("mouse_drag", {"start_x": 0, "start_y": 0, "end_x": 1, "end_y": 1}),
+    ("list_capture_devices", {}),
+])
+def test_plain_tools_reply_with_ok_json(client, sleeps, name, arguments):
+    client.list_capture_devices.return_value = {}
+    result = reply(name, **arguments)
+    assert result["ok"] is True and result["tool"] == name
+    if name == "list_capture_devices":
+        assert result["devices"] == []
+    else:
+        assert result["sent"] is True and result["message"]
+
+
+def test_input_failure_after_sending_is_unknown_delivery(client, sleeps):
+    client.type_text.side_effect = srv.KvmClientError("lost")
+    result = reply("type_text", text="abc", ime_off=False)
+    assert result == {"ok": False, "tool": "type_text", "error": "kvm_error",
+                      "detail": "lost", "sent": None, "retry_safe": False}
+
+
+def test_read_only_failure_is_retry_safe(client):
+    client.get_device_info.side_effect = srv.KvmClientError("down")
+    result = reply("get_device_info")
+    assert result["error"] == "kvm_error" and result["retry_safe"] is True
+    assert "sent" not in result
+
+
+def test_unreachable_server_sends_nothing(monkeypatch):
+    def refuse():
+        raise ConnectionRefusedError("refused")
+    monkeypatch.setattr(srv, "get_client", refuse)
+    result = reply("mouse_click", x=1, y=2)
+    assert result["error"] == "kvm_unreachable"
+    assert result["sent"] is False and result["retry_safe"] is True
+
+
+def test_server_down_stays_unreachable_on_later_calls(monkeypatch):
+    dead = Mock()
+    dead.connect.side_effect = ConnectionRefusedError("refused")
+    monkeypatch.setattr(srv, "KvmClient", Mock(return_value=dead))
+    monkeypatch.setattr(srv, "_client", None)
+    for _ in range(2):
+        result = reply("mouse_click", x=1, y=2)
+        assert result["error"] == "kvm_unreachable" and result["sent"] is False
+    assert srv._client is None
+    dead.mouse_click.assert_not_called()
+
+
+def test_dropped_connection_reconnects_before_input(client, sleeps):
+    client.connected = False
+    client.connect.side_effect = ConnectionRefusedError("refused")
+    result = reply("type_text", text="abc")
+    assert result["error"] == "kvm_unreachable" and result["sent"] is False
+    client.type_text.assert_not_called()
+    client.send_key.assert_not_called()
