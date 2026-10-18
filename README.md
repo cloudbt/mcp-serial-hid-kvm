@@ -89,7 +89,8 @@ capture_screen (also stores the full capture as the pre-action baseline)
 → Vision model verifies result
 ```
 
-For `mouse_scroll`, `mouse_click`, `send_key` and `type_text`, an optional
+For `mouse_scroll`, `mouse_click`, `send_key`, `type_text`, `type_japanese` and
+`type_chinese`, an optional
 `after` combines action → optional cursor parking → wait → screenshot in one
 MCP call. Omitting `after` returns only the JSON action result. See
 [action observation options, stage results and timing](docs/action-after.md).
@@ -107,7 +108,7 @@ The calling model must inspect the final capture.
 
 ## Available tools
 
-29 tools are callable; 23 are advertised by default (22 when only one Target
+31 tools are callable; 25 are advertised by default (24 when only one Target
 endpoint is configured). Tools marked hidden are setup or rarely used tuning/state
 tools; hidden tools remain callable. `select_target` is hidden by default only when
 the configured targets resolve to a single endpoint. `SHKVM_HIDDEN_TOOLS` replaces
@@ -117,6 +118,8 @@ exposed or invoked.
 | Tool | Purpose |
 |---|---|
 | `type_text` | ASCII HID, inline tags, optional raw mode; actual newlines press Enter; sends HID `0x91` (IME off) first unless `ime_off=false` (default from runtime `type_ime_off_default`, true) |
+| `type_japanese` | Japanese (kanji, kana, punctuation, ASCII) typed through the Target IME as HID keys; no clipboard or PowerShell; `dry_run` returns the plan |
+| `type_chinese` | Chinese (simplified/traditional, punctuation, ASCII) typed the same way |
 | `send_key` | One HID key with optional modifiers |
 | `mouse_move` | Absolute/relative HID cursor movement |
 | `mouse_click` | Optional coordinate and button; `count` 1–3 for double/triple click |
@@ -201,6 +204,29 @@ Stable waits use the supplied ROI or full screen. Resolution mismatch is an erro
 requiring a fresh capture/baseline; different frame sizes are never silently
 resized into comparable contexts. Timeout returns the last score and
 `timed_out=true`. Capture/transport failures remain errors.
+
+### Japanese and Chinese through the IME
+
+`type_japanese` and `type_chinese` type text the way a person does, through the
+Target's Microsoft IME, so they also work where only the keyboard reaches
+(RDP sessions, VMs, no PowerShell). Requirements: Microsoft IME (Japanese) in
+romaji input mode, the default. No Chinese IME is needed.
+
+| Characters | Keys |
+|---|---|
+| ASCII | IME off (`0x91`), typed raw; newlines press Enter |
+| Hiragana (`type_japanese`) | IME on (`0x90`), one fixed romaji spelling per character, Enter |
+| Katakana (`type_japanese`) | Same romaji, F7, Enter |
+| Everything else (kanji, simplified Chinese, full-width punctuation, symbols) | 4-digit upper-case Unicode hex, F5 (IME code conversion), Enter |
+
+Every character is chosen by code, not by IME conversion guesses, so the
+result is deterministic. It is still not verified by the server: inspect the
+screenshot. Glyphs missing from the Target font (often simplified Chinese on
+Japanese Windows) render as boxes although the right code point was typed.
+Only BMP characters (U+0000-U+FFFF) are accepted, up to 2000 per call. The
+IME ends switched off. `ime_convert_ms` (runtime, default 250) is the pause
+after F5/F7 before Enter. Measured on TargetPC1: about 0.6 s per code-converted
+character; kana and ASCII are faster.
 
 ### Unicode and verification
 

@@ -275,6 +275,7 @@ def test_input_tools_cover_all_hid_generating_tools():
         "type_text", "send_key",
         "mouse_move", "mouse_click", "mouse_drag", "mouse_scroll",
         "open_shell", "paste_unicode_text", "transfer_unicode_file",
+        "type_japanese", "type_chinese",
     }
     assert srv.INPUT_TOOLS == expected
 

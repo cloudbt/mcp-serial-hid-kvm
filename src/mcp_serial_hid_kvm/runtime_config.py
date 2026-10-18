@@ -39,6 +39,8 @@ DEFAULTS: dict = {
     # passes ime_off=false. 0x91 selects half-width alphanumeric rather than
     # toggling, so repeating it is harmless.
     "type_ime_off_default": True,
+    # type_japanese/type_chinese: pause after F5/F7 conversion before Enter.
+    "ime_convert_ms": 250,
     "click_hold_ms": 50,
     "click_after_ms": 100,
     "key_hold_ms": 30,
@@ -63,6 +65,7 @@ _SPECS: dict = {
     "default_wsl_distro": (str, None, None),
     "clear_input_before_command": (bool, None, None),
     "type_ime_off_default": (bool, None, None),
+    "ime_convert_ms": (_INT, 0, 5000),
     "click_hold_ms": (_INT, 0, 10000),
     "click_after_ms": (_INT, 0, 10000),
     "key_hold_ms": (_INT, 0, 10000),
