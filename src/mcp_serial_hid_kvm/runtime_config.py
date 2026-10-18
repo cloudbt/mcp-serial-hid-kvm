@@ -35,6 +35,10 @@ DEFAULTS: dict = {
     # Clear the target input line (PSReadLine Esc/RevertLine) before typing a
     # Unicode payload command, so consecutive transfers do not concatenate.
     "clear_input_before_command": True,
+    # type_text presses HID 0x91 (Japanese IME off) first unless the call
+    # passes ime_off=false. 0x91 selects half-width alphanumeric rather than
+    # toggling, so repeating it is harmless.
+    "type_ime_off_default": True,
     "click_hold_ms": 50,
     "click_after_ms": 100,
     "key_hold_ms": 30,
@@ -58,6 +62,7 @@ _FLOAT = float
 _SPECS: dict = {
     "default_wsl_distro": (str, None, None),
     "clear_input_before_command": (bool, None, None),
+    "type_ime_off_default": (bool, None, None),
     "click_hold_ms": (_INT, 0, 10000),
     "click_after_ms": (_INT, 0, 10000),
     "key_hold_ms": (_INT, 0, 10000),

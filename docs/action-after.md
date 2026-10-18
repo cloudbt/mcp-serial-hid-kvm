@@ -1,7 +1,7 @@
 # Observe an action in one MCP call
 
 `mouse_scroll`, `mouse_click`, `send_key` and `type_text` accept optional `after`.
-Omit the field to keep the original behavior and text-only return format.
+Omit the field to keep the original behavior: only the JSON action result.
 `after: {}` means no cursor parking, the usual stability wait and a full-screen
 image. Typing and pressing Enter can still be separate calls.
 

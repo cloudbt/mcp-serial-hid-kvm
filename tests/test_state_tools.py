@@ -60,7 +60,8 @@ def test_removed_tools_have_no_dispatch_or_connection(name, monkeypatch):
     client = Mock(side_effect=AssertionError("must not connect"))
     monkeypatch.setattr(srv, "get_client", client)
     monkeypatch.setattr(srv.config, "hidden_tools", REMOVED)
-    assert asyncio.run(srv.call_tool(name, {}))[0].text == f"Unknown tool: {name}"
+    result = json.loads(asyncio.run(srv.call_tool(name, {}))[0].text)
+    assert result == {"ok": False, "tool": name, "error": "unknown_tool"}
     client.assert_not_called()
 
 
