@@ -21,6 +21,8 @@ REMOVED = {
     "execute_and_read", "run_powershell_until_done", "run_task_and_report",
     # Removed in #4: deprecated aliases and the send_key_sequence duplicate.
     "screen_changed", "wait_for_screen_change", "send_key_sequence",
+    # Superseded by type_japanese/type_chinese.
+    "transfer_unicode_file",
 }
 
 
@@ -120,19 +122,8 @@ def test_unicode_auto_paste_refused_before_hid(context):
     context.type_text.assert_not_called()
 
 
-def test_unicode_transfer_reports_unverified_delivery(context, monkeypatch):
-    async def no_wait(seconds):
-        pass
-    monkeypatch.setattr(srv.asyncio, "sleep", no_wait)
-    result = call("transfer_unicode_file", text="test", target_path="C:\\Temp\\x.txt", focus_shell=False)
-    assert result["write_requested"] and result["written"] is None and not result["verified"]
-    assert result["verification"] == "calling_model_required"
-    context.set_timing.assert_called()
-
-
 @pytest.mark.parametrize("tool,args", [
     ("paste_unicode_text", {"text": "test", "focus_shell": False}),
-    ("transfer_unicode_file", {"text": "test", "target_path": "C:\\Temp\\x.txt", "focus_shell": False}),
 ])
 def test_unicode_typing_failure_restores_timing(tool, args, context, monkeypatch):
     async def no_wait(seconds):

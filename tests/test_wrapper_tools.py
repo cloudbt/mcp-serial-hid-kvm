@@ -1,6 +1,6 @@
 """Deterministic unit tests for the Route A wrapper-tool helpers.
 
-These cover configuration, Unicode transfer and input locks without hardware.
+These cover configuration, Unicode paste and input locks without hardware.
 """
 
 import os
@@ -175,54 +175,6 @@ def test_paste_unicode_estimate_seconds_normal_timing():
     assert srv._paste_unicode_estimate_seconds(1000, 20, 20) == 40.0
 
 
-# --- ops tools: transfer_unicode_file command building -----------------------
-
-def test_transfer_commands_are_pure_ascii():
-    init_cmd, chunk_cmds, final_cmd, _, _, _ = srv._transfer_build_commands(
-        "日本語の手順書\nライン2", r"C:\Temp\runbook.md")
-    for cmd in [init_cmd, *chunk_cmds, final_cmd]:
-        assert cmd.isascii()
-
-
-def test_transfer_commands_roundtrip():
-    import base64 as b64
-    text = "日本語テスト ABC 123\n改行もOK"
-    _, chunk_cmds, _, sha12, payload_chars, utf8_bytes = \
-        srv._transfer_build_commands(text, r"C:\Temp\t.txt", chunk_chars=100)
-    # Reassemble the payload exactly as the target-side PowerShell would.
-    import re as _re
-    payload = "".join(
-        _re.search(r"-Value '([^']*)' -NoNewline$", c).group(1)
-        for c in chunk_cmds)
-    assert len(payload) == payload_chars
-    padded = payload.replace("-", "+").replace("_", "/")
-    padded += "=" * ((-len(padded)) % 4)
-    decoded = b64.b64decode(padded)
-    assert decoded.decode("utf-8") == text
-    assert len(decoded) == utf8_bytes
-    import hashlib as _hashlib
-    assert _hashlib.sha256(decoded).hexdigest()[:12].upper() == sha12
-
-
-def test_transfer_commands_escape_single_quotes_in_path():
-    _, _, final_cmd, _, _, _ = srv._transfer_build_commands(
-        "x", r"C:\Temp\o'brien.txt")
-    assert r"o''brien.txt" in final_cmd
-
-
-def test_transfer_final_command_hides_xfer_marker():
-    _, _, final_cmd, _, _, _ = srv._transfer_build_commands("x", r"C:\t.txt")
-    assert "XFER_OK" not in final_cmd          # echo-safety (split string)
-    assert "'XF'+'ER_OK '" in final_cmd
-
-
-def test_transfer_chunking_respects_chunk_size():
-    text = "あ" * 500  # 500 CJK chars -> 2000 base64 chars
-    _, chunk_cmds, _, _, payload_chars, _ = srv._transfer_build_commands(
-        text, r"C:\t.txt", chunk_chars=300)
-    assert len(chunk_cmds) == (payload_chars + 299) // 300
-
-
 # --- ops tools: input lock ---------------------------------------------------
 
 def _reset_lock():
@@ -251,7 +203,6 @@ def test_input_lock_allows_dry_run_variants():
         srv._do_set_input_lock(locked=True)
         assert srv._check_input_lock("paste_unicode_text", {"dry_run": True}) is None
         assert srv._check_input_lock("paste_unicode_text", {}) is not None
-        assert srv._check_input_lock("transfer_unicode_file", {"dry_run": True}) is None
     finally:
         _reset_lock()
 
@@ -274,7 +225,7 @@ def test_input_tools_cover_all_hid_generating_tools():
     expected = {
         "type_text", "send_key",
         "mouse_move", "mouse_click", "mouse_drag", "mouse_scroll",
-        "open_shell", "paste_unicode_text", "transfer_unicode_file",
+        "open_shell", "paste_unicode_text",
         "type_japanese", "type_chinese",
     }
     assert srv.INPUT_TOOLS == expected
