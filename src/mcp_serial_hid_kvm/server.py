@@ -32,6 +32,7 @@ from .vision import StateEngine
 from .vision.tools import state_tools
 from .runtime_config import RuntimeConfig
 from .file_copy import CopyManager, file_copy_tools
+from . import ime_input
 from .after import ACTION_TOOLS, after_schema, validate_options
 from .vision.state import _roi
 
@@ -749,7 +750,12 @@ INPUT_TOOLS = {
     "type_text", "send_key",
     "mouse_move", "mouse_click", "mouse_drag", "mouse_scroll",
     "open_shell", "paste_unicode_text", "transfer_unicode_file",
+    "type_japanese", "type_chinese",
 }
+
+# Input tools whose dry_run sends nothing.
+_DRY_RUN_TOOLS = ("paste_unicode_text", "transfer_unicode_file", "type_japanese", "type_chinese")
+_IME_LANGUAGE = {"type_japanese": "japanese", "type_chinese": "chinese"}
 
 
 _UNLOCK_CONFIRM = "UNLOCK"
@@ -757,13 +763,13 @@ _UNLOCK_CONFIRM = "UNLOCK"
 
 def _check_input_lock(name: str, arguments: dict) -> dict | None:
     """Return a refusal payload if *name* is an input tool and the lock is set."""
-    dry = name in ("paste_unicode_text", "transfer_unicode_file") and arguments.get("dry_run")
+    dry = name in _DRY_RUN_TOOLS and arguments.get("dry_run")
     if _input_lock is not None and name in INPUT_TOOLS and not dry:
         return {"ok": False, "error": "input_locked", "reason": _input_lock.get("reason"),
                 "since": _input_lock.get("since"), "detail": "Input interlock is enabled."}
     busy = _copies.busy(_current_target) if name in INPUT_TOOLS | {"select_target", "set_capture_device", "set_capture_resolution", "configure"} else None
     if busy:
-        if name in ("paste_unicode_text", "transfer_unicode_file") and arguments.get("dry_run"):
+        if name in _DRY_RUN_TOOLS and arguments.get("dry_run"):
             return None
         return {"ok": False, "error": "file_copy_owns_input", "job_id": busy,
                 "detail": "Cancel, observe helper cleanup, then release the copy job."}
@@ -772,8 +778,7 @@ def _check_input_lock(name: str, arguments: dict) -> dict | None:
     if _input_lock is None or name not in INPUT_TOOLS:
         return None
     # dry_run variants produce no HID input.
-    if name in ("paste_unicode_text", "transfer_unicode_file") \
-            and arguments.get("dry_run"):
+    if name in _DRY_RUN_TOOLS and arguments.get("dry_run"):
         return None
     return {
         "ok": False,
@@ -1021,6 +1026,8 @@ def _validate_action(name, arguments):
         delay = arguments.get("char_delay_ms")
         if delay is not None and (type(delay) is not int or delay < 0):
             raise ValueError("char_delay_ms must be a nonnegative integer")
+    elif name in _IME_LANGUAGE:
+        ime_input.plan(arguments["text"], _IME_LANGUAGE[name])
     elif name == "send_key":
         key = arguments["key"]
         if (not isinstance(key, str) or not key or
@@ -1058,6 +1065,13 @@ async def _send_action(client, name, arguments, guard=lambda: None):
             guard()
         client.type_text(text, arguments.get("char_delay_ms"), raw=arguments.get("raw", False))
         return f"Typed {len(text)} characters"
+    if name in _IME_LANGUAGE:
+        segments = ime_input.plan(arguments["text"], _IME_LANGUAGE[name])
+        await ime_input.send(client, segments, guard=guard,
+                             convert_s=get_config().get("ime_convert_ms") / 1000)
+        counts = ime_input.summary(segments)
+        return (f"Typed {len(arguments['text'])} characters via IME "
+                f"({counts['code_conversions']} code conversions)")
     if name == "send_key":
         key, modifiers = arguments["key"], arguments.get("modifiers", [])
         client.send_key(key, modifiers)
@@ -1765,6 +1779,7 @@ async def _all_tools() -> list[Tool]:
     ]
     tools.extend(state_tools())
     tools.extend(file_copy_tools())
+    tools.extend(ime_input.ime_tools())
     definitions = {t.name: t for t in tools}
     schema = after_schema(definitions["capture_screen"].inputSchema,
                           definitions["wait_for_stable"].inputSchema)
@@ -1823,6 +1838,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         definitions = {tool.name: tool for tool in await _all_tools()}
         if name not in definitions:
             return _json_reply({"ok": False, "tool": name, "error": "unknown_tool"})
+        if name in _IME_LANGUAGE and arguments.get("dry_run"):
+            if "after" in arguments:
+                raise ValueError("dry_run sends no input; omit after")
+            segments = ime_input.plan(arguments["text"], _IME_LANGUAGE[name])
+            return _json_reply({"tool": name, "dry_run": True, "sent": False,
+                                "text_chars": len(arguments["text"]),
+                                **ime_input.summary(segments)})
         try:
             client = get_client()
             # A failed request drops the socket. Reconnect here, before any

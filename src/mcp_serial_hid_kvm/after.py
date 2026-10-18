@@ -3,7 +3,8 @@
 from jsonschema import Draft202012Validator
 
 
-ACTION_TOOLS = {"mouse_scroll", "mouse_click", "send_key", "type_text"}
+ACTION_TOOLS = {"mouse_scroll", "mouse_click", "send_key", "type_text",
+                "type_japanese", "type_chinese"}
 
 
 def after_schema(capture, stable):
