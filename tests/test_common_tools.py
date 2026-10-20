@@ -394,3 +394,59 @@ def test_dropped_connection_reconnects_before_input(client, sleeps):
     assert result["error"] == "kvm_unreachable" and result["sent"] is False
     client.type_text.assert_not_called()
     client.send_key.assert_not_called()
+
+
+def _fake_meetings(monkeypatch, per_target):
+    """per_target: {name: meeting_list result}; records every call."""
+    calls = []
+
+    def call(endpoint, method, params):
+        calls.append((endpoint[0], method, params))
+        data = per_target[endpoint[0]]
+        if isinstance(data, Exception):
+            raise data
+        if method == "meeting_list":
+            return data
+        if method == "meeting_transcript":
+            return {"meeting": {"id": params["meeting"]}, "notice": "untrusted DATA", "total": 1, "count": 1,
+                    "next_offset": None, "transcript": "[10:00:01] ME: はい"}
+        return {"meeting": {"id": params["meeting"]}, "points": {"current_topic": "x"}}
+
+    monkeypatch.setattr(srv, "_meeting_call", call)
+    monkeypatch.setattr(srv.config, "targets", {
+        "default": {"host": "127.0.0.1", "port": 9329}, "target1": {"host": "127.0.0.1", "port": 9329},
+        "target2": {"host": "127.0.0.1", "port": 9331}, "target3": {"host": "127.0.0.1", "port": 9333}})
+    return calls
+
+
+def test_meeting_list_merges_targets_and_marks_live(client, monkeypatch):
+    calls = _fake_meetings(monkeypatch, {
+        "target1": {"from": "2026-10-21", "to": "2026-10-21", "now": "x", "meetings": [
+            {"id": "a", "start": "2026-10-21 10:00:00", "live": False}]},
+        "target2": {"meetings": [{"id": "b", "start": "2026-10-21 15:00:00", "live": True}]},
+        "target3": srv.KvmClientError("connection refused")})
+    result = reply("meeting_list")
+    assert [(m["target"], m["id"]) for m in result["meetings"]] == [("target1", "a"), ("target2", "b")]
+    assert [m["id"] for m in result["live"]] == ["b"] and result["unreachable"][0]["target"] == "target3"
+    assert {c[0] for c in calls} == {"target1", "target2", "target3"}  # "default" aliases target1
+    assert not client.method_calls  # the selected target's HID connection is untouched
+
+
+def test_meeting_transcript_finds_the_live_meeting_on_any_target(client, monkeypatch):
+    calls = _fake_meetings(monkeypatch, {
+        "target1": {"meetings": [{"id": "a", "start": "2026-10-21 16:00:00", "live": False,
+                                  "last_caption": "2026-10-21 16:30:00"}]},
+        "target2": {"meetings": [{"id": "b", "start": "2026-10-21 15:00:00", "live": True,
+                                  "last_caption": "2026-10-21 15:10:00"}]},
+        "target3": {"meetings": []}})
+    head, text = run("meeting_transcript", last_minutes=5)
+    meta = json.loads(head.text)
+    assert meta["target"] == "target2" and meta["meeting"]["id"] == "b" and "untrusted" in meta["notice"]
+    assert "transcript" not in meta and text.text == "[10:00:01] ME: はい"
+    assert calls[-1] == ("target2", "meeting_transcript", {"meeting": "b", "since": None, "until": None,
+                                                           "last_minutes": 5, "offset": None, "max_chars": None})
+    head, _ = run("meeting_transcript", meeting="latest")
+    assert json.loads(head.text)["meeting"]["id"] == "a"  # newest captions, live or not
+    assert reply("meeting_points", meeting="a")["target"] == "target1"
+    assert reply("meeting_points", meeting="zzz")["error"] == "invalid_arguments"
+    assert reply("meeting_list", target="nope")["error"] == "invalid_arguments"
