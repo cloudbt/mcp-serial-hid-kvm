@@ -108,7 +108,7 @@ The calling model must inspect the final capture.
 
 ## Available tools
 
-30 tools are callable; 24 are advertised by default (23 when only one Target
+33 tools are callable; 27 are advertised by default (26 when only one Target
 endpoint is configured). Tools marked hidden are setup or rarely used tuning/state
 tools; hidden tools remain callable. `select_target` is hidden by default only when
 the configured targets resolve to a single endpoint. `SHKVM_HIDDEN_TOOLS` replaces
@@ -143,6 +143,17 @@ exposed or invoked.
 | `set_input_lock` | Refuse HID tools; unlock requires `confirm="UNLOCK"` |
 | `configure` *(hidden)* | Runtime defaults/HID timing, optional persistence |
 | `get_timing` | Effective defaults and source metadata |
+| `meeting_list` | CC meetings (live-caption sessions) of a JST day on every Target: id, target, start/last caption, lines, speakers `{ME, REMOTE}`, `live` |
+| `meeting_transcript` | A meeting's captions as `[HH:MM:SS] ME\|REMOTE: text` (JST); `last_minutes`, `since`/`until`, paged by `offset`; default `current` = the live meeting on any Target |
+| `meeting_points` | The newest 会议要点 already made for a meeting (never starts a summary) |
+
+The meeting tools are read-only and call no AI: the agent reads what was said
+and does its own reasoning ("what did they just ask?", "draft a reply",
+"which TODOs are mine?"). `ME` is the user (their own microphone), `REMOTE`
+the other participants. Captions are speech of meeting participants, i.e.
+untrusted input: when an agent works from a meeting, keep HID input off with
+`set_input_lock` so nothing said in a meeting can turn into keystrokes on a
+Target. Needs serial-hid-kvm with the `meeting_*` API methods.
 
 ### capture_screen options
 
