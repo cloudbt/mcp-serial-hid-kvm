@@ -1567,6 +1567,88 @@ async def _all_tools() -> list[Tool]:
                 "required": ["locked"],
             },
         ),
+        # -------------------------------------------------------------------
+        # Server recording, live captions (CC) and meeting points on the
+        # selected target - the same as the web viewer's buttons (every open
+        # viewer sees the change). Need the target server's web viewer.
+        # -------------------------------------------------------------------
+        Tool(
+            name="recording_start",
+            description=(
+                "Start a server-side screen recording (video + audio) on the selected target, like the "
+                "web viewer's Record button. Only one recording per target. Max 3 h. "
+                "Meeting minutes after the recording are off unless 'minutes' names a summarizer."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "fps": {"type": "integer", "enum": [15, 30], "description": "Frame rate (default 15)."},
+                    "source": {"type": "string", "enum": ["mix", "hdmi", "mic", "none"],
+                               "description": "Audio: target HDMI + host mic (mix, default), hdmi, mic or none."},
+                    "minutes": {"type": "string", "enum": ["off", "agy", "codex", "mac-qwen"],
+                                "description": "AI meeting minutes after saving (default off)."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="recording_stop",
+            description=(
+                "Stop the selected target's server recording. Saving the MP4 continues in the background; "
+                "poll recording_status until 'last' shows the saved path."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        Tool(
+            name="recording_status",
+            description=(
+                "Server recording state of the selected target: recording (active, elapsed, started_by "
+                "viewer/api), saving, and last (the last finished recording: path or error)."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        Tool(
+            name="captions_set",
+            description=(
+                "Turn live captions (CC, target HDMI audio) on or off for the selected target. One "
+                "switch shared by every viewer. Turning it off never starts an AI summary."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {"on": {"type": "boolean", "description": "true = CC on, false = off."}},
+                "required": ["on"],
+            },
+        ),
+        Tool(
+            name="captions_status",
+            description="Live captions state of the selected target: available, on, since, hub state (live/connecting/offline/off).",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        Tool(
+            name="meeting_points",
+            description=(
+                "Latest meeting points (会议要点) of the current caption session: current_topic, points, "
+                "decisions, todos, open_questions; plus state (idle/running/failed), session and minutes job. "
+                "Read-only, no AI call."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        Tool(
+            name="meeting_summarize",
+            description=(
+                "Summarize the meeting captions now (like 立即总结) with the server's summarizer. Calls AI. "
+                "Runs in the background: poll meeting_points until state is idle with new data."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        Tool(
+            name="meeting_minutes",
+            description=(
+                "Queue AI meeting minutes from this meeting's captions alone (like 生成会议记录; remote "
+                "voice only). Calls AI in the background; meeting_points shows the job's progress."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
     ]
     tools.extend(state_tools())
     tools.extend(file_copy_tools())
@@ -1577,6 +1659,20 @@ async def _all_tools() -> list[Tool]:
     for name in ACTION_TOOLS:
         definitions[name].inputSchema["properties"]["after"] = schema
     return tools
+
+
+# Tools served by the target server's web viewer (API method = tool name)
+# and the arguments passed through.
+_WEB_TOOLS = {
+    "recording_start": ("fps", "source", "minutes"),
+    "recording_stop": (),
+    "recording_status": (),
+    "captions_set": ("on",),
+    "captions_status": (),
+    "meeting_points": (),
+    "meeting_summarize": (),
+    "meeting_minutes": (),
+}
 
 
 @app.list_tools()
@@ -1813,6 +1909,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         elif name == "get_timing":
             result = _do_get_timing(client, include_source=arguments.get("include_source", True))
             return _json_reply(result)
+
+        elif name in _WEB_TOOLS:
+            params = {key: arguments[key] for key in _WEB_TOOLS[name] if key in arguments}
+            result = await asyncio.to_thread(client.call, name, params)
+            return _json_reply({"tool": name, "ok": True, **result})
 
         elif name == "paste_unicode_text":
             result = await _do_paste_unicode_text(

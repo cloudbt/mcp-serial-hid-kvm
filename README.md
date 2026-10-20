@@ -108,7 +108,7 @@ The calling model must inspect the final capture.
 
 ## Available tools
 
-30 tools are callable; 24 are advertised by default (23 when only one Target
+38 tools are callable; 32 are advertised by default (31 when only one Target
 endpoint is configured). Tools marked hidden are setup or rarely used tuning/state
 tools; hidden tools remain callable. `select_target` is hidden by default only when
 the configured targets resolve to a single endpoint. `SHKVM_HIDDEN_TOOLS` replaces
@@ -143,6 +143,17 @@ exposed or invoked.
 | `set_input_lock` | Refuse HID tools; unlock requires `confirm="UNLOCK"` |
 | `configure` *(hidden)* | Runtime defaults/HID timing, optional persistence |
 | `get_timing` | Effective defaults and source metadata |
+| `recording_start` | Server recording on the selected Target (like the viewer's Record button); `fps`, `source`, `minutes` (default `off` = no AI minutes) |
+| `recording_stop` | Stop it; the MP4 is saved in the background |
+| `recording_status` | Recording state, `started_by`, and the last saved file (`last.path`) |
+| `captions_set` | Live captions (CC) on/off — one switch for every viewer |
+| `captions_status` | CC availability, on/off, hub state |
+| `meeting_points` | Latest meeting points of the current CC session (no AI call) |
+| `meeting_summarize` | Summarize now (like 立即总结, calls AI); poll `meeting_points` |
+| `meeting_minutes` | Queue minutes from the captions (like 生成会议记录, calls AI) |
+
+The recording, CC and meeting tools need the Target server's web viewer
+(`--web`). They are not HID input, so `set_input_lock` does not block them.
 
 ### capture_screen options
 

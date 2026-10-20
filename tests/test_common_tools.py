@@ -394,3 +394,25 @@ def test_dropped_connection_reconnects_before_input(client, sleeps):
     assert result["error"] == "kvm_unreachable" and result["sent"] is False
     client.type_text.assert_not_called()
     client.send_key.assert_not_called()
+
+
+def test_recording_cc_and_meeting_tools_pass_through_to_the_target(client):
+    client.call.return_value = {"recording": {"active": True, "started_by": "api"}}
+    result = reply("recording_start", fps=30, source="hdmi", minutes="off", bogus=1)
+    assert result["ok"] is True and result["recording"]["started_by"] == "api"
+    client.call.assert_called_with("recording_start", {"fps": 30, "source": "hdmi", "minutes": "off"})
+    client.call.return_value = {"on": True}
+    assert reply("captions_set", on=True)["on"] is True
+    client.call.assert_called_with("captions_set", {"on": True})
+    for name in ("recording_stop", "recording_status", "captions_status", "meeting_points",
+                 "meeting_summarize", "meeting_minutes"):
+        reply(name)
+        client.call.assert_called_with(name, {})
+    listed = {t.name for t in asyncio.run(srv.list_tools())}
+    assert set(srv._WEB_TOOLS) <= listed
+
+
+def test_web_tool_errors_are_reported(client):
+    client.call.side_effect = srv.KvmClientError("recording_status needs the web viewer (--web)")
+    result = reply("recording_status")
+    assert result["ok"] is False and result["error"] == "kvm_error" and "web viewer" in json.dumps(result)
